@@ -4,6 +4,89 @@ import os
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from pwnman.pwnman.ssh_client import SSHClient
+import re
+
+PLUGIN_DIR_CANDIDATES = [
+    "/usr/local/share/pwnagotchi/custom-plugins",
+    "/usr/local/share/pwnagotchi/installed-plugins",
+    "/usr/local/share/pwnagotchi/available-plugins",
+    "/usr/local/share/pwnagotchi/plugins",
+    "/usr/share/pwnagotchi/plugins",
+    "/etc/pwnagotchi/plugins",
+    "/home/pi/custom-plugins",
+]
+
+
+def parse_plugins_from_ls(output: str) -> list[str]:
+    names = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("total"):
+            continue
+        # accept *.py filenames
+        if line.endswith(".py"):
+            base = line[:-3]
+            if base and base != "__init__":
+                names.append(base)
+    return sorted(set(names))
+
+
+def extract_enabled_from_toml(toml_text: str) -> dict[str, bool]:
+    """
+    Detect patterns like:
+      main.plugins.foo.enabled = true
+    or table form:
+      [main.plugins.foo]
+      enabled = true
+    """
+    enabled = {}
+    # dotted form
+    for m in re.finditer(r"^\s*main\.plugins\.([a-zA-Z0-9_\-]+)\.enabled\s*=\s*(true|false)\s*$",
+                         toml_text, flags=re.MULTILINE):
+        enabled[m.group(1)] = (m.group(2) == "true")
+
+    # table form
+    # [main.plugins.foo]
+    # enabled = true
+    for m in re.finditer(r"^\s*\[main\.plugins\.([a-zA-Z0-9_\-]+)\]\s*$", toml_text, flags=re.MULTILINE):
+        name = m.group(1)
+        # search forward a bit for enabled=
+        start = m.end()
+        chunk = toml_text[start:start+800]  # enough for small blocks
+        m2 = re.search(r"^\s*enabled\s*=\s*(true|false)\s*$", chunk, flags=re.MULTILINE)
+        if m2:
+            enabled[name] = (m2.group(1) == "true")
+
+    return enabled
+
+
+def set_plugin_enabled_in_toml(toml_text: str, plugin: str, enabled: bool) -> str:
+    import re
+    val = "true" if enabled else "false"
+
+    dotted = re.compile(rf"^(\s*main\.plugins\.{re.escape(plugin)}\.enabled\s*=\s*)(true|false)\s*$",
+                        flags=re.MULTILINE)
+    if dotted.search(toml_text):
+        return dotted.sub(rf"\1{val}", toml_text)
+
+    table = re.compile(rf"^\s*\[main\.plugins\.{re.escape(plugin)}\]\s*$", flags=re.MULTILINE)
+    m = table.search(toml_text)
+    if m:
+        # within the block until next [section] or EOF
+        start = m.end()
+        next_sec = re.search(r"^\s*\[.+\]\s*$", toml_text[start:], flags=re.MULTILINE)
+        end = start + (next_sec.start() if next_sec else len(toml_text[start:]))
+
+        block = toml_text[start:end]
+        en_re = re.compile(r"^(\s*enabled\s*=\s*)(true|false)\s*$", flags=re.MULTILINE)
+        if en_re.search(block):
+            block2 = en_re.sub(rf"\1{val}", block)
+        else:
+            block2 = block.rstrip() + f"\nenabled = {val}\n"
+        return toml_text[:start] + block2 + toml_text[end:]
+
+    append = f"\n[main.plugins.{plugin}]\nenabled = {val}\n"
+    return toml_text.rstrip() + append + "\n"
 
 
 class Worker(QtCore.QObject):
@@ -123,6 +206,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.status = QtWidgets.QStatusBar()
         self.setStatusBar(self.status)
+        self._tab_plugins()
+        self._tab_face()
+
 
     def _tab_status(self):
         w = QtWidgets.QWidget()
@@ -285,6 +371,189 @@ class MainWindow(QtWidgets.QMainWindow):
         l.addStretch(1)
 
         self.tabs.addTab(w, "Power")
+
+    def _tab_plugins(self):
+        w = QtWidgets.QWidget()
+        l = QtWidgets.QVBoxLayout(w)
+
+        top = QtWidgets.QHBoxLayout()
+        self.btn_plugins_refresh = QtWidgets.QPushButton("Refresh plugins")
+        self.btn_plugins_refresh.clicked.connect(self.on_plugins_refresh)
+        self.btn_plugins_apply = QtWidgets.QPushButton("Apply changes (save config + restart)")
+        self.btn_plugins_apply.clicked.connect(self.on_plugins_apply)
+
+        top.addWidget(self.btn_plugins_refresh)
+        top.addWidget(self.btn_plugins_apply)
+        top.addStretch(1)
+
+        self.plugins_table = QtWidgets.QTableWidget(0, 3)
+        self.plugins_table.setHorizontalHeaderLabels(["Plugin", "Installed", "Enabled"])
+        self.plugins_table.horizontalHeader().setStretchLastSection(True)
+        self.plugins_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.plugins_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+
+        l.addLayout(top)
+        l.addWidget(self.plugins_table, 1)
+
+        self.tabs.addTab(w, "Plugins")
+
+    def on_plugins_refresh(self):
+        cfg_path = self.cfg_path.text().strip()
+
+        def do():
+            # 1) read config
+            cfg = self.ssh.run(f"sudo cat {cfg_path} || cat {cfg_path}", timeout_sec=20).stdout
+
+            enabled_map = extract_enabled_from_toml(cfg)
+
+            # 2) discover installed plugins by searching dirs
+            found = set()
+            for d in PLUGIN_DIR_CANDIDATES:
+                r = self.ssh.run(f"ls -1 {d} 2>/dev/null || true")
+                for name in parse_plugins_from_ls(r.stdout):
+                    found.add(name)
+
+            # also list python packages that look like pwnagotchi plugins (optional)
+            return cfg, sorted(found), enabled_map
+
+        def done(res, err):
+            if err:
+                self._log(f"[ERROR] {err}")
+                return
+
+            cfg, installed, enabled_map = res
+            # fill table: union of installed + enabled_map keys
+            all_names = sorted(set(installed) | set(enabled_map.keys()))
+
+            self.plugins_table.setRowCount(0)
+            for i, name in enumerate(all_names):
+                self.plugins_table.insertRow(i)
+
+                item_name = QtWidgets.QTableWidgetItem(name)
+                item_inst = QtWidgets.QTableWidgetItem("yes" if name in installed else "no")
+                item_inst.setFlags(item_inst.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+
+                chk = QtWidgets.QTableWidgetItem()
+                chk.setFlags(chk.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                chk.setCheckState(
+                    QtCore.Qt.CheckState.Checked if enabled_map.get(name, False) else QtCore.Qt.CheckState.Unchecked)
+
+                self.plugins_table.setItem(i, 0, item_name)
+                self.plugins_table.setItem(i, 1, item_inst)
+                self.plugins_table.setItem(i, 2, chk)
+
+            self._log(f"Plugins refreshed: {len(all_names)} shown.")
+
+        run_in_thread(self, do, done)
+
+    def on_plugins_apply(self):
+        cfg_path = self.cfg_path.text().strip()
+
+        # gather desired states from table
+        desired = {}
+        for row in range(self.plugins_table.rowCount()):
+            name = self.plugins_table.item(row, 0).text()
+            chk = self.plugins_table.item(row, 2)
+            desired[name] = (chk.checkState() == QtCore.Qt.CheckState.Checked)
+
+        def do():
+            # read config
+            cfg = self.ssh.run(f"sudo cat {cfg_path} || cat {cfg_path}", timeout_sec=20).stdout
+
+            # apply toggles only for plugins that appear in config or installed list
+            for name, en in desired.items():
+                cfg = set_plugin_enabled_in_toml(cfg, name, en)
+
+            # save using existing save logic approach (tmp + backup + mv)
+            tmp = "/tmp/pwnagotchi_config.toml"
+            bak = f"{cfg_path}.bak.$(date +%Y%m%d-%H%M%S)"
+            safe = cfg.replace("\\", "\\\\").replace("$", "\\$").replace("`", "\\`")
+            script = (
+                f"cat > {tmp} <<'EOF'\n{safe}\nEOF\n"
+                f"sudo cp -a {cfg_path} {bak} 2>/dev/null || true\n"
+                f"sudo mv {tmp} {cfg_path} || mv {tmp} {cfg_path}\n"
+                f"sudo systemctl restart pwnagotchi || sudo service pwnagotchi restart || true\n"
+            )
+            r = self.ssh.run(f"bash -lc {quote_bash(script)}", timeout_sec=30)
+            if r.exit_status != 0:
+                # restart might fail on non-systemd; still report file write success if possible
+                pass
+            return (r.stdout + "\n" + r.stderr).strip() or "Applied."
+
+        def done(res, err):
+            if err:
+                self._log(f"[ERROR] {err}")
+                QtWidgets.QMessageBox.critical(self, "Apply failed", str(err))
+                return
+            self._log("Applied plugin config changes.")
+            self._log(res)
+            QtWidgets.QMessageBox.information(self, "Done", "Plugin settings applied. Service restart attempted.")
+
+        run_in_thread(self, do, done)
+
+    def _tab_face(self):
+        w = QtWidgets.QWidget()
+        l = QtWidgets.QVBoxLayout(w)
+
+        top = QtWidgets.QHBoxLayout()
+        self.face_source = QtWidgets.QComboBox()
+        self.face_source.addItems([
+            "Parse last log line containing face",
+            "Use a simple status command (fallback)",
+        ])
+        self.btn_face = QtWidgets.QPushButton("Refresh face")
+        self.btn_face.clicked.connect(self.on_face_refresh)
+
+        top.addWidget(self.face_source)
+        top.addWidget(self.btn_face)
+        top.addStretch(1)
+
+        self.face_big = QtWidgets.QLabel("(-_-)")
+        f = self.face_big.font()
+        f.setPointSize(44)
+        self.face_big.setFont(f)
+        self.face_big.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+        self.face_info = QtWidgets.QPlainTextEdit()
+        self.face_info.setReadOnly(True)
+
+        l.addLayout(top)
+        l.addWidget(self.face_big)
+        l.addWidget(self.face_info, 1)
+
+        self.tabs.addTab(w, "Face")
+
+    def on_face_refresh(self):
+        mode = self.face_source.currentIndex()
+
+        def do():
+            if mode == 0:
+                # try logs
+                cmd = r"tail -n 400 /var/log/pwnagotchi.log 2>/dev/null | grep -Eo '\([^\)]*\)' | tail -n 1 || true"
+                r = self.ssh.run(cmd, timeout_sec=15)
+                face = r.stdout.strip()
+                # also show a small device summary
+                info = self.ssh.run("hostname; uptime -p || uptime", timeout_sec=10).stdout.strip()
+                return face, info
+            else:
+                # fallback: show service + uptime and pick a face based on state
+                s = self.ssh.run("systemctl is-active pwnagotchi 2>/dev/null || true").stdout.strip()
+                up = self.ssh.run("uptime -p || uptime", timeout_sec=10).stdout.strip()
+                face = "(^_^)" if s == "active" else "(o_O)"
+                return face, f"pwnagotchi service: {s}\n{up}"
+
+        def done(res, err):
+            if err:
+                self._log(f"[ERROR] {err}")
+                return
+            face, info = res
+            if not face:
+                face = "(._.)"
+            self.face_big.setText(face)
+            self.face_info.setPlainText(info)
+            self._log("Face refreshed.")
+
+        run_in_thread(self, do, done)
 
     def _pick_key(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select SSH private key", os.path.expanduser("~"))
