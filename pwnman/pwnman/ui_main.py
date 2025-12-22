@@ -208,7 +208,262 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setStatusBar(self.status)
         self._tab_plugins()
         self._tab_face()
+        self._tab_lcd_dashboard()
 
+    def _tab_lcd_dashboard(self):
+        w = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(w)
+
+        # Top controls
+        top = QtWidgets.QHBoxLayout()
+        self.btn_lcd_refresh = QtWidgets.QPushButton("Refresh LCD dashboard")
+        self.btn_lcd_refresh.clicked.connect(self.on_lcd_refresh)
+
+        self.btn_lcd_restart = QtWidgets.QPushButton("Restart pwnagotchi")
+        self.btn_lcd_restart.clicked.connect(self.on_lcd_restart)
+
+        self.lcd_autorefresh = QtWidgets.QCheckBox("Auto refresh (5s)")
+        self.lcd_autorefresh.stateChanged.connect(
+            self._lcd_autorefresh_changed)
+
+        top.addWidget(self.btn_lcd_refresh)
+        top.addWidget(self.btn_lcd_restart)
+        top.addWidget(self.lcd_autorefresh)
+        top.addStretch(1)
+        outer.addLayout(top)
+
+        # Face + quick status
+        grid = QtWidgets.QGridLayout()
+
+        self.lcd_face = QtWidgets.QLabel("(._.)")
+        f = self.lcd_face.font()
+        f.setPointSize(48)
+        self.lcd_face.setFont(f)
+        self.lcd_face.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.lcd_face.setMinimumHeight(110)
+
+        self.lcd_quick = QtWidgets.QPlainTextEdit()
+        self.lcd_quick.setReadOnly(True)
+        self.lcd_quick.setMinimumHeight(110)
+
+        grid.addWidget(self.lcd_face, 0, 0)
+        grid.addWidget(self.lcd_quick, 0, 1)
+
+        outer.addLayout(grid)
+
+        # Split: BT / Plugins / Details
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+
+        # Bluetooth panel
+        bt_box = QtWidgets.QGroupBox("Bluetooth")
+        bt_l = QtWidgets.QVBoxLayout(bt_box)
+        self.lcd_bt = QtWidgets.QPlainTextEdit()
+        self.lcd_bt.setReadOnly(True)
+        bt_l.addWidget(self.lcd_bt)
+        split.addWidget(bt_box)
+
+        # Plugins panel
+        pl_box = QtWidgets.QGroupBox("Plugins")
+        pl_l = QtWidgets.QVBoxLayout(pl_box)
+
+        self.lcd_plugins_table = QtWidgets.QTableWidget(0, 3)
+        self.lcd_plugins_table.setHorizontalHeaderLabels(
+            ["Plugin", "Installed", "Enabled"])
+        self.lcd_plugins_table.horizontalHeader().setStretchLastSection(True)
+        self.lcd_plugins_table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.lcd_plugins_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+
+        pl_l.addWidget(self.lcd_plugins_table)
+        split.addWidget(pl_box)
+
+        # Details panel
+        det_box = QtWidgets.QGroupBox("Details (best-effort)")
+        det_l = QtWidgets.QVBoxLayout(det_box)
+        self.lcd_details = QtWidgets.QPlainTextEdit()
+        self.lcd_details.setReadOnly(True)
+        self.lcd_details.setFont(QtGui.QFontDatabase.systemFont(
+            QtGui.QFontDatabase.SystemFont.FixedFont))
+        det_l.addWidget(self.lcd_details)
+        split.addWidget(det_box)
+
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 2)
+        split.setStretchFactor(2, 2)
+
+        outer.addWidget(split, 1)
+
+        # Timer for auto refresh
+        self._lcd_timer = QtCore.QTimer(self)
+        self._lcd_timer.setInterval(5000)
+        self._lcd_timer.timeout.connect(self.on_lcd_refresh)
+
+        self.tabs.addTab(w, "LCD")
+
+    def _lcd_autorefresh_changed(self):
+        if self.lcd_autorefresh.isChecked():
+            self._lcd_timer.start()
+            self._log("LCD auto refresh: ON")
+        else:
+            self._lcd_timer.stop()
+            self._log("LCD auto refresh: OFF")
+
+    def on_lcd_restart(self):
+        if QtWidgets.QMessageBox.question(
+                self,
+                "Restart",
+                "Restart pwnagotchi service now?",
+        ) != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        def do():
+            cmd = (
+                "sudo systemctl restart pwnagotchi || "
+                "sudo service pwnagotchi restart || "
+                "systemctl restart pwnagotchi || "
+                "service pwnagotchi restart"
+            )
+            r = self.ssh.run(cmd, timeout_sec=25)
+            return (r.stdout + "\n" + r.stderr).strip()
+
+        def done(res, err):
+            if err:
+                self._log(f"[ERROR] {err}")
+                QtWidgets.QMessageBox.critical(self, "Restart failed",
+                                               str(err))
+                return
+            self._log("Restart attempted.")
+            if res:
+                self._log(res)
+            # Refresh after restart
+            self.on_lcd_refresh()
+
+        run_in_thread(self, do, done)
+
+    def on_lcd_refresh(self):
+        cfg_path = self.cfg_path.text().strip() if hasattr(self,
+                                                           "cfg_path") else "/etc/pwnagotchi/config.toml"
+
+        def do():
+            # Face (best-effort): try to extract last "(...)" from pwnagotchi log
+            face_cmd = r"""
+            LOG="$(ls -1t /var/log/pwnagotchi*.log 2>/dev/null | head -n 1)"
+            [ -n "$LOG" ] || LOG="/var/log/pwnagotchi.log"
+
+            # Extract (...) tokens, drop pure MACs, prefer ones that look like emoticons
+            tail -n 1200 "$LOG" 2>/dev/null \
+              | grep -Eo '\([^)]{1,40}\)' \
+              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+              | grep -viE '^\([0-9a-f]{2}(:[0-9a-f]{2}){5}\)$' \
+              | grep -E '\([[:space:][:punct:][:alnum:]]+\)' \
+              | tail -n 1 || true
+            """
+            face_r = self.ssh.run(f"bash -lc {quote_bash(face_cmd)}",
+                                  timeout_sec=15)
+            face = face_r.stdout.strip() or "(._.)"
+
+            # Quick status
+            quick_cmd = """
+    set -e
+    echo "Host: $(hostname)"
+    echo "Uptime: $(uptime -p 2>/dev/null || uptime)"
+    echo "Kernel: $(uname -r)"
+    echo "IP(s):"
+    ip -4 addr show 2>/dev/null | awk '/inet /{print "  " $2 "  " $NF}' || true
+    echo "Disk (/): $(df -h / | tail -n 1 | awk '{print $3 "/" $2 " used (" $5 ")"}')"
+    echo "pwnagotchi: $(systemctl is-active pwnagotchi 2>/dev/null || true)"
+    echo "bettercap:  $(systemctl is-active bettercap 2>/dev/null || true)"
+    """
+            quick_r = self.ssh.run(f"bash -lc {quote_bash(quick_cmd)}",
+                                   timeout_sec=20)
+            quick = (quick_r.stdout or quick_r.stderr).strip()
+
+            # Bluetooth info (best-effort, works on many RPi images)
+            bt_cmd = """
+    set -e
+    echo "Service:"
+    (systemctl is-active bluetooth 2>/dev/null || service bluetooth status 2>/dev/null || true) | head -n 3
+    echo
+    echo "Adapter:"
+    (hciconfig -a 2>/dev/null || true) | sed -n '1,120p'
+    echo
+    echo "Paired devices:"
+    (bluetoothctl paired-devices 2>/dev/null || true)
+    """
+            bt_r = self.ssh.run(f"bash -lc {quote_bash(bt_cmd)}",
+                                timeout_sec=20)
+            bt = (bt_r.stdout or bt_r.stderr).strip()
+
+            # Config + plugin enabled map
+            cfg_r = self.ssh.run(
+                f"sudo cat {cfg_path} 2>/dev/null || cat {cfg_path} 2>/dev/null || true",
+                timeout_sec=20)
+            cfg = cfg_r.stdout or ""
+            enabled_map = extract_enabled_from_toml(cfg) if cfg else {}
+
+            # Installed plugins (scan dirs)
+            installed = set()
+            for d in PLUGIN_DIR_CANDIDATES:
+                r = self.ssh.run(f"ls -1 {d} 2>/dev/null || true")
+                for name in parse_plugins_from_ls(r.stdout):
+                    installed.add(name)
+
+            # “Details” panel: show last lines from pwnagotchi log and pwnagotchi service status
+            det_cmd = r"""
+    echo "=== systemctl status pwnagotchi (short) ==="
+    (systemctl status pwnagotchi --no-pager -n 30 2>/dev/null || true) | sed -n '1,120p'
+    echo
+    echo "=== /var/log/pwnagotchi.log (last 60) ==="
+    (tail -n 60 /var/log/pwnagotchi.log 2>/dev/null || true)
+    """
+            det_r = self.ssh.run(f"bash -lc {quote_bash(det_cmd)}",
+                                 timeout_sec=25)
+            details = (det_r.stdout or det_r.stderr).strip()
+
+            all_names = sorted(set(installed) | set(enabled_map.keys()))
+            return {
+                "face": face or "(._.)",
+                "quick": quick,
+                "bt": bt,
+                "plugins_all": all_names,
+                "plugins_installed": installed,
+                "plugins_enabled": enabled_map,
+                "details": details,
+            }
+
+        def done(res, err):
+            if err:
+                self._log(f"[ERROR] {err}")
+                return
+
+            self.lcd_face.setText(res["face"])
+            self.lcd_quick.setPlainText(res["quick"])
+            self.lcd_bt.setPlainText(res["bt"])
+            self.lcd_details.setPlainText(res["details"])
+
+            # Fill plugin table
+            all_names = res["plugins_all"]
+            installed = res["plugins_installed"]
+            enabled_map = res["plugins_enabled"]
+
+            self.lcd_plugins_table.setRowCount(0)
+            for i, name in enumerate(all_names):
+                self.lcd_plugins_table.insertRow(i)
+                self.lcd_plugins_table.setItem(i, 0,
+                                               QtWidgets.QTableWidgetItem(
+                                                   name))
+                self.lcd_plugins_table.setItem(i, 1,
+                                               QtWidgets.QTableWidgetItem(
+                                                   "yes" if name in installed else "no"))
+                self.lcd_plugins_table.setItem(i, 2,
+                                               QtWidgets.QTableWidgetItem(
+                                                   "yes" if enabled_map.get(
+                                                       name, False) else "no"))
+
+            self._log("LCD dashboard refreshed.")
+
+        run_in_thread(self, do, done)
 
     def _tab_status(self):
         w = QtWidgets.QWidget()
