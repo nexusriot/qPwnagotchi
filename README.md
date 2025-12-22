@@ -8,6 +8,8 @@ A small PyQt app to manage **your own** Pwnagotchi over SSH for:
 - upload/download files via SFTP
 - reboot/shutdown
 
+![Screenshot](screenshot.png)
+
 This project intentionally does **not** provide features for offensive actions.
 
 ## Install

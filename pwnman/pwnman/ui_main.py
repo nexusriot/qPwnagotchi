@@ -138,7 +138,7 @@ def quote_bash(script: str) -> str:
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Pwnagotchi Manager (Maintenance)")
+        self.setWindowTitle("Pwnagotchi Manager v.0.0.2")
         self.resize(980, 700)
 
         self.ssh = SSHClient()
