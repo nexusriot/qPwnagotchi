@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import os
+import re
+import stat
+from typing import Optional
+
 from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtWebEngineWidgets
 
 from pwnman.pwnman.ssh_client import SSHClient
-import re
+from pwnman.pwnman.file_manager import FileManagerWidget
 
+
+# NOTE: your device may have this typo-dir:
+# /usr/local/share/pwnagotchi/availaible-plugins
 PLUGIN_DIR_CANDIDATES = [
+    "/usr/local/share/pwnagotchi/availaible-plugins",  # <-- important for your install
     "/usr/local/share/pwnagotchi/custom-plugins",
     "/usr/local/share/pwnagotchi/installed-plugins",
     "/usr/local/share/pwnagotchi/available-plugins",
@@ -23,7 +32,6 @@ def parse_plugins_from_ls(output: str) -> list[str]:
         line = line.strip()
         if not line or line.startswith("total"):
             continue
-        # accept *.py filenames
         if line.endswith(".py"):
             base = line[:-3]
             if base and base != "__init__":
@@ -32,27 +40,23 @@ def parse_plugins_from_ls(output: str) -> list[str]:
 
 
 def extract_enabled_from_toml(toml_text: str) -> dict[str, bool]:
-    """
-    Detect patterns like:
-      main.plugins.foo.enabled = true
-    or table form:
-      [main.plugins.foo]
-      enabled = true
-    """
-    enabled = {}
-    # dotted form
-    for m in re.finditer(r"^\s*main\.plugins\.([a-zA-Z0-9_\-]+)\.enabled\s*=\s*(true|false)\s*$",
-                         toml_text, flags=re.MULTILINE):
+    enabled: dict[str, bool] = {}
+
+    for m in re.finditer(
+        r"^\s*main\.plugins\.([a-zA-Z0-9_\-]+)\.enabled\s*=\s*(true|false)\s*$",
+        toml_text,
+        flags=re.MULTILINE,
+    ):
         enabled[m.group(1)] = (m.group(2) == "true")
 
-    # table form
-    # [main.plugins.foo]
-    # enabled = true
-    for m in re.finditer(r"^\s*\[main\.plugins\.([a-zA-Z0-9_\-]+)\]\s*$", toml_text, flags=re.MULTILINE):
+    for m in re.finditer(
+        r"^\s*\[main\.plugins\.([a-zA-Z0-9_\-]+)\]\s*$",
+        toml_text,
+        flags=re.MULTILINE,
+    ):
         name = m.group(1)
-        # search forward a bit for enabled=
         start = m.end()
-        chunk = toml_text[start:start+800]  # enough for small blocks
+        chunk = toml_text[start:start + 800]
         m2 = re.search(r"^\s*enabled\s*=\s*(true|false)\s*$", chunk, flags=re.MULTILINE)
         if m2:
             enabled[name] = (m2.group(1) == "true")
@@ -61,18 +65,18 @@ def extract_enabled_from_toml(toml_text: str) -> dict[str, bool]:
 
 
 def set_plugin_enabled_in_toml(toml_text: str, plugin: str, enabled: bool) -> str:
-    import re
     val = "true" if enabled else "false"
 
-    dotted = re.compile(rf"^(\s*main\.plugins\.{re.escape(plugin)}\.enabled\s*=\s*)(true|false)\s*$",
-                        flags=re.MULTILINE)
+    dotted = re.compile(
+        rf"^(\s*main\.plugins\.{re.escape(plugin)}\.enabled\s*=\s*)(true|false)\s*$",
+        flags=re.MULTILINE,
+    )
     if dotted.search(toml_text):
         return dotted.sub(rf"\1{val}", toml_text)
 
     table = re.compile(rf"^\s*\[main\.plugins\.{re.escape(plugin)}\]\s*$", flags=re.MULTILINE)
     m = table.search(toml_text)
     if m:
-        # within the block until next [section] or EOF
         start = m.end()
         next_sec = re.search(r"^\s*\[.+\]\s*$", toml_text[start:], flags=re.MULTILINE)
         end = start + (next_sec.start() if next_sec else len(toml_text[start:]))
@@ -123,6 +127,10 @@ def run_in_thread(parent: QtWidgets.QWidget, fn, cb, *args, **kwargs):
     thread.started.connect(worker.run)
     thread.start()
     return thread
+
+
+def quote_bash(script: str) -> str:
+    return "'" + script.replace("'", "'\"'\"'") + "'"
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -188,282 +196,151 @@ class MainWindow(QtWidgets.QMainWindow):
 
         layout.addWidget(conn)
 
-        self.tabs = QtWidgets.QTabWidget()
-        layout.addWidget(self.tabs, 1)
+        layout.addWidget(QtWidgets.QLabel("Console"))
+        self.console = QtWidgets.QPlainTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setMaximumBlockCount(2000)
+        layout.addWidget(self.console, 1)
 
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        layout.addWidget(self.tabs, 3)
+
+        self._tab_lcd()
+
+        # then the rest
         self._tab_status()
         self._tab_services()
         self._tab_logs()
         self._tab_config()
         self._tab_files()
         self._tab_power()
+        self._tab_plugins()
 
-        self.console = QtWidgets.QPlainTextEdit()
-        self.console.setReadOnly(True)
-        self.console.setMaximumBlockCount(2000)
-        layout.addWidget(QtWidgets.QLabel("Console"))
-        layout.addWidget(self.console, 1)
+        # ensure LCD selected
+        self.tabs.setCurrentIndex(0)
 
         self.status = QtWidgets.QStatusBar()
         self.setStatusBar(self.status)
-        self._tab_plugins()
-        self._tab_face()
-        self._tab_lcd_dashboard()
 
-    def _tab_lcd_dashboard(self):
+    def _tab_lcd(self):
         w = QtWidgets.QWidget()
         outer = QtWidgets.QVBoxLayout(w)
 
-        # Top controls
-        top = QtWidgets.QHBoxLayout()
-        self.btn_lcd_refresh = QtWidgets.QPushButton("Refresh LCD dashboard")
-        self.btn_lcd_refresh.clicked.connect(self.on_lcd_refresh)
+        webbar = QtWidgets.QHBoxLayout()
 
-        self.btn_lcd_restart = QtWidgets.QPushButton("Restart pwnagotchi")
-        self.btn_lcd_restart.clicked.connect(self.on_lcd_restart)
+        self.lcd_url = QtWidgets.QLineEdit("http://10.0.0.2:8080/")
+        self.lcd_user = QtWidgets.QLineEdit("changeme")
+        self.lcd_pass = QtWidgets.QLineEdit("changeme")
+        self.lcd_pass.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
 
-        self.lcd_autorefresh = QtWidgets.QCheckBox("Auto refresh (5s)")
-        self.lcd_autorefresh.stateChanged.connect(
-            self._lcd_autorefresh_changed)
+        self.btn_lcd_open = QtWidgets.QPushButton("Open Web LCD")
+        self.btn_lcd_reload = QtWidgets.QPushButton("Reload")
 
-        top.addWidget(self.btn_lcd_refresh)
-        top.addWidget(self.btn_lcd_restart)
-        top.addWidget(self.lcd_autorefresh)
-        top.addStretch(1)
-        outer.addLayout(top)
+        self.lcd_auto_reload = QtWidgets.QCheckBox("Auto reload")
+        self.lcd_auto_reload.setChecked(True)
 
-        # Face + quick status
-        grid = QtWidgets.QGridLayout()
+        self.lcd_reload_sec = QtWidgets.QSpinBox()
+        self.lcd_reload_sec.setRange(1, 120)
+        self.lcd_reload_sec.setValue(5)
 
-        self.lcd_face = QtWidgets.QLabel("(._.)")
-        f = self.lcd_face.font()
-        f.setPointSize(48)
-        self.lcd_face.setFont(f)
-        self.lcd_face.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.lcd_face.setMinimumHeight(110)
+        self.lcd_zoom = QtWidgets.QDoubleSpinBox()
+        self.lcd_zoom.setRange(0.2, 2.0)
+        self.lcd_zoom.setSingleStep(0.1)
+        self.lcd_zoom.setValue(0.5)  # 50% default
+        self.lcd_zoom.setSuffix("x")
 
-        self.lcd_quick = QtWidgets.QPlainTextEdit()
-        self.lcd_quick.setReadOnly(True)
-        self.lcd_quick.setMinimumHeight(110)
+        webbar.addWidget(QtWidgets.QLabel("URL:"))
+        webbar.addWidget(self.lcd_url, 1)
+        webbar.addWidget(QtWidgets.QLabel("User:"))
+        webbar.addWidget(self.lcd_user)
+        webbar.addWidget(QtWidgets.QLabel("Pass:"))
+        webbar.addWidget(self.lcd_pass)
+        webbar.addWidget(self.btn_lcd_open)
+        webbar.addWidget(self.btn_lcd_reload)
+        webbar.addWidget(self.lcd_auto_reload)
+        webbar.addWidget(QtWidgets.QLabel("sec:"))
+        webbar.addWidget(self.lcd_reload_sec)
+        webbar.addWidget(QtWidgets.QLabel("Zoom:"))
+        webbar.addWidget(self.lcd_zoom)
 
-        grid.addWidget(self.lcd_face, 0, 0)
-        grid.addWidget(self.lcd_quick, 0, 1)
+        outer.addLayout(webbar)
 
-        outer.addLayout(grid)
+        self.lcd_web = QtWebEngineWidgets.QWebEngineView()
+        # Reduce flicker (helps with "glitch")
+        self.lcd_web.setAttribute(QtCore.Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.lcd_web.setStyleSheet("background: #000;")
+        # Keep it compact (you can remove if you want it bigger)
+        self.lcd_web.setMinimumHeight(260)
 
-        # Split: BT / Plugins / Details
-        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        outer.addWidget(self.lcd_web, 1)
 
-        # Bluetooth panel
-        bt_box = QtWidgets.QGroupBox("Bluetooth")
-        bt_l = QtWidgets.QVBoxLayout(bt_box)
-        self.lcd_bt = QtWidgets.QPlainTextEdit()
-        self.lcd_bt.setReadOnly(True)
-        bt_l.addWidget(self.lcd_bt)
-        split.addWidget(bt_box)
+        page = self.lcd_web.page()
+        page.authenticationRequired.connect(self._lcd_on_auth_required)
 
-        # Plugins panel
-        pl_box = QtWidgets.QGroupBox("Plugins")
-        pl_l = QtWidgets.QVBoxLayout(pl_box)
+        self.btn_lcd_open.clicked.connect(self._lcd_open_web)
+        self.btn_lcd_reload.clicked.connect(self._lcd_reload_now)
 
-        self.lcd_plugins_table = QtWidgets.QTableWidget(0, 3)
-        self.lcd_plugins_table.setHorizontalHeaderLabels(
-            ["Plugin", "Installed", "Enabled"])
-        self.lcd_plugins_table.horizontalHeader().setStretchLastSection(True)
-        self.lcd_plugins_table.setSelectionBehavior(
-            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.lcd_plugins_table.setEditTriggers(
-            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.lcd_zoom.valueChanged.connect(lambda v: self.lcd_web.setZoomFactor(float(v)))
 
-        pl_l.addWidget(self.lcd_plugins_table)
-        split.addWidget(pl_box)
+        self._lcd_web_timer = QtCore.QTimer(self)
+        self._lcd_web_timer.timeout.connect(self._lcd_web_autoreload_tick)
+        self.lcd_auto_reload.stateChanged.connect(self._lcd_web_autoreload_changed)
+        self.lcd_reload_sec.valueChanged.connect(self._lcd_web_autoreload_changed)
+        self.lcd_web.loadFinished.connect(self._lcd_apply_zoom)
 
-        # Details panel
-        det_box = QtWidgets.QGroupBox("Details (best-effort)")
-        det_l = QtWidgets.QVBoxLayout(det_box)
-        self.lcd_details = QtWidgets.QPlainTextEdit()
-        self.lcd_details.setReadOnly(True)
-        self.lcd_details.setFont(QtGui.QFontDatabase.systemFont(
-            QtGui.QFontDatabase.SystemFont.FixedFont))
-        det_l.addWidget(self.lcd_details)
-        split.addWidget(det_box)
-
-        split.setStretchFactor(0, 1)
-        split.setStretchFactor(1, 2)
-        split.setStretchFactor(2, 2)
-
-        outer.addWidget(split, 1)
-
-        # Timer for auto refresh
-        self._lcd_timer = QtCore.QTimer(self)
-        self._lcd_timer.setInterval(5000)
-        self._lcd_timer.timeout.connect(self.on_lcd_refresh)
+        QtCore.QTimer.singleShot(0, self._lcd_web_autoreload_changed)
 
         self.tabs.addTab(w, "LCD")
 
-    def _lcd_autorefresh_changed(self):
-        if self.lcd_autorefresh.isChecked():
-            self._lcd_timer.start()
-            self._log("LCD auto refresh: ON")
-        else:
-            self._lcd_timer.stop()
-            self._log("LCD auto refresh: OFF")
-
-    def on_lcd_restart(self):
-        if QtWidgets.QMessageBox.question(
-                self,
-                "Restart",
-                "Restart pwnagotchi service now?",
-        ) != QtWidgets.QMessageBox.StandardButton.Yes:
+    def _lcd_open_web(self):
+        url = self.lcd_url.text().strip()
+        if not url:
             return
+        self._log(f"LCD Web: opening {url}")
+        self.lcd_web.setUrl(QtCore.QUrl(url))
 
-        def do():
-            cmd = (
-                "sudo systemctl restart pwnagotchi || "
-                "sudo service pwnagotchi restart || "
-                "systemctl restart pwnagotchi || "
-                "service pwnagotchi restart"
-            )
-            r = self.ssh.run(cmd, timeout_sec=25)
-            return (r.stdout + "\n" + r.stderr).strip()
+    def _lcd_reload_now(self):
+        if self.lcd_web.url().isValid():
+            self.lcd_web.reload()
+        else:
+            self._lcd_open_web()
+        self._lcd_apply_zoom(True)
 
-        def done(res, err):
-            if err:
-                self._log(f"[ERROR] {err}")
-                QtWidgets.QMessageBox.critical(self, "Restart failed",
-                                               str(err))
-                return
-            self._log("Restart attempted.")
-            if res:
-                self._log(res)
-            # Refresh after restart
-            self.on_lcd_refresh()
+    def _lcd_on_auth_required(self, url, authenticator):
+        authenticator.setUser(self.lcd_user.text())
+        authenticator.setPassword(self.lcd_pass.text())
 
-        run_in_thread(self, do, done)
+    def _lcd_apply_zoom(self, ok=True):
+        if hasattr(self, "lcd_web") and hasattr(self, "lcd_zoom"):
+            self.lcd_web.setZoomFactor(float(self.lcd_zoom.value()))
 
-    def on_lcd_refresh(self):
-        cfg_path = self.cfg_path.text().strip() if hasattr(self,
-                                                           "cfg_path") else "/etc/pwnagotchi/config.toml"
+    def _lcd_web_autoreload_changed(self):
+        if not hasattr(self, "_lcd_web_timer"):
+            return
+        if self.lcd_auto_reload.isChecked():
+            self._lcd_web_timer.start(int(self.lcd_reload_sec.value()) * 1000)
+            self._log(f"LCD Web auto reload: ON ({self.lcd_reload_sec.value()}s)")
+        else:
+            self._lcd_web_timer.stop()
+            self._log("LCD Web auto reload: OFF")
 
-        def do():
-            # Face (best-effort): try to extract last "(...)" from pwnagotchi log
-            face_cmd = r"""
-            LOG="$(ls -1t /var/log/pwnagotchi*.log 2>/dev/null | head -n 1)"
-            [ -n "$LOG" ] || LOG="/var/log/pwnagotchi.log"
+    def _lcd_web_autoreload_tick(self):
+        # avoid annoying reload while typing credentials/url
+        if self.lcd_url.hasFocus() or self.lcd_user.hasFocus() or self.lcd_pass.hasFocus():
+            return
+        if self.lcd_web.url().isValid():
+            self.lcd_web.reload()
+            self._lcd_apply_zoom(True)
 
-            # Extract (...) tokens, drop pure MACs, prefer ones that look like emoticons
-            tail -n 1200 "$LOG" 2>/dev/null \
-              | grep -Eo '\([^)]{1,40}\)' \
-              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-              | grep -viE '^\([0-9a-f]{2}(:[0-9a-f]{2}){5}\)$' \
-              | grep -E '\([[:space:][:punct:][:alnum:]]+\)' \
-              | tail -n 1 || true
-            """
-            face_r = self.ssh.run(f"bash -lc {quote_bash(face_cmd)}",
-                                  timeout_sec=15)
-            face = face_r.stdout.strip() or "(._.)"
-
-            # Quick status
-            quick_cmd = """
-    set -e
-    echo "Host: $(hostname)"
-    echo "Uptime: $(uptime -p 2>/dev/null || uptime)"
-    echo "Kernel: $(uname -r)"
-    echo "IP(s):"
-    ip -4 addr show 2>/dev/null | awk '/inet /{print "  " $2 "  " $NF}' || true
-    echo "Disk (/): $(df -h / | tail -n 1 | awk '{print $3 "/" $2 " used (" $5 ")"}')"
-    echo "pwnagotchi: $(systemctl is-active pwnagotchi 2>/dev/null || true)"
-    echo "bettercap:  $(systemctl is-active bettercap 2>/dev/null || true)"
-    """
-            quick_r = self.ssh.run(f"bash -lc {quote_bash(quick_cmd)}",
-                                   timeout_sec=20)
-            quick = (quick_r.stdout or quick_r.stderr).strip()
-
-            # Bluetooth info (best-effort, works on many RPi images)
-            bt_cmd = """
-    set -e
-    echo "Service:"
-    (systemctl is-active bluetooth 2>/dev/null || service bluetooth status 2>/dev/null || true) | head -n 3
-    echo
-    echo "Adapter:"
-    (hciconfig -a 2>/dev/null || true) | sed -n '1,120p'
-    echo
-    echo "Paired devices:"
-    (bluetoothctl paired-devices 2>/dev/null || true)
-    """
-            bt_r = self.ssh.run(f"bash -lc {quote_bash(bt_cmd)}",
-                                timeout_sec=20)
-            bt = (bt_r.stdout or bt_r.stderr).strip()
-
-            # Config + plugin enabled map
-            cfg_r = self.ssh.run(
-                f"sudo cat {cfg_path} 2>/dev/null || cat {cfg_path} 2>/dev/null || true",
-                timeout_sec=20)
-            cfg = cfg_r.stdout or ""
-            enabled_map = extract_enabled_from_toml(cfg) if cfg else {}
-
-            # Installed plugins (scan dirs)
-            installed = set()
-            for d in PLUGIN_DIR_CANDIDATES:
-                r = self.ssh.run(f"ls -1 {d} 2>/dev/null || true")
-                for name in parse_plugins_from_ls(r.stdout):
-                    installed.add(name)
-
-            # “Details” panel: show last lines from pwnagotchi log and pwnagotchi service status
-            det_cmd = r"""
-    echo "=== systemctl status pwnagotchi (short) ==="
-    (systemctl status pwnagotchi --no-pager -n 30 2>/dev/null || true) | sed -n '1,120p'
-    echo
-    echo "=== /var/log/pwnagotchi.log (last 60) ==="
-    (tail -n 60 /var/log/pwnagotchi.log 2>/dev/null || true)
-    """
-            det_r = self.ssh.run(f"bash -lc {quote_bash(det_cmd)}",
-                                 timeout_sec=25)
-            details = (det_r.stdout or det_r.stderr).strip()
-
-            all_names = sorted(set(installed) | set(enabled_map.keys()))
-            return {
-                "face": face or "(._.)",
-                "quick": quick,
-                "bt": bt,
-                "plugins_all": all_names,
-                "plugins_installed": installed,
-                "plugins_enabled": enabled_map,
-                "details": details,
-            }
-
-        def done(res, err):
-            if err:
-                self._log(f"[ERROR] {err}")
-                return
-
-            self.lcd_face.setText(res["face"])
-            self.lcd_quick.setPlainText(res["quick"])
-            self.lcd_bt.setPlainText(res["bt"])
-            self.lcd_details.setPlainText(res["details"])
-
-            # Fill plugin table
-            all_names = res["plugins_all"]
-            installed = res["plugins_installed"]
-            enabled_map = res["plugins_enabled"]
-
-            self.lcd_plugins_table.setRowCount(0)
-            for i, name in enumerate(all_names):
-                self.lcd_plugins_table.insertRow(i)
-                self.lcd_plugins_table.setItem(i, 0,
-                                               QtWidgets.QTableWidgetItem(
-                                                   name))
-                self.lcd_plugins_table.setItem(i, 1,
-                                               QtWidgets.QTableWidgetItem(
-                                                   "yes" if name in installed else "no"))
-                self.lcd_plugins_table.setItem(i, 2,
-                                               QtWidgets.QTableWidgetItem(
-                                                   "yes" if enabled_map.get(
-                                                       name, False) else "no"))
-
-            self._log("LCD dashboard refreshed.")
-
-        run_in_thread(self, do, done)
+    def _on_tab_changed(self, idx: int):
+        # helps reduce WebEngine flicker/glitch on tab switch
+        try:
+            if self.tabs.tabText(idx) == "LCD" and hasattr(self, "lcd_web"):
+                self._lcd_apply_zoom(True)
+                QtCore.QTimer.singleShot(50, self.lcd_web.repaint)
+        except Exception:
+            pass
 
     def _tab_status(self):
         w = QtWidgets.QWidget()
@@ -486,13 +363,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         top = QtWidgets.QHBoxLayout()
         self.service_name = QtWidgets.QComboBox()
-        self.service_name.addItems([
-            "pwnagotchi",
-            "bettercap",
-            "bluetooth",
-            "ssh",
-            "networking",
-        ])
+        self.service_name.addItems(["pwnagotchi", "bettercap", "bluetooth", "ssh", "networking"])
 
         self.btn_svc_status = QtWidgets.QPushButton("Status")
         self.btn_svc_start = QtWidgets.QPushButton("Start")
@@ -576,31 +447,9 @@ class MainWindow(QtWidgets.QMainWindow):
         w = QtWidgets.QWidget()
         l = QtWidgets.QVBoxLayout(w)
 
-        grid = QtWidgets.QGridLayout()
-        self.remote_path = QtWidgets.QLineEdit("/home/pi/")
-        self.local_path = QtWidgets.QLineEdit(os.path.expanduser("~/"))
-
-        self.btn_pick_local = QtWidgets.QPushButton("Pick local…")
-        self.btn_pick_local.clicked.connect(self._pick_local)
-
-        self.btn_dl = QtWidgets.QPushButton("Download remote → local")
-        self.btn_ul = QtWidgets.QPushButton("Upload local → remote")
-        self.btn_dl.clicked.connect(self.on_download)
-        self.btn_ul.clicked.connect(self.on_upload)
-
-        grid.addWidget(QtWidgets.QLabel("Remote path (file)"), 0, 0)
-        grid.addWidget(self.remote_path, 0, 1, 1, 2)
-        grid.addWidget(QtWidgets.QLabel("Local path (file)"), 1, 0)
-        grid.addWidget(self.local_path, 1, 1)
-        grid.addWidget(self.btn_pick_local, 1, 2)
-
-        btns = QtWidgets.QHBoxLayout()
-        btns.addWidget(self.btn_dl)
-        btns.addWidget(self.btn_ul)
-        btns.addStretch(1)
-
-        l.addLayout(grid)
-        l.addLayout(btns)
+        self.fileman = FileManagerWidget(self.ssh, parent=self)
+        self.fileman.log.connect(self._log)
+        l.addWidget(self.fileman, 1)
 
         self.tabs.addTab(w, "Files")
 
@@ -652,173 +501,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tabs.addTab(w, "Plugins")
 
-    def on_plugins_refresh(self):
-        cfg_path = self.cfg_path.text().strip()
-
-        def do():
-            # 1) read config
-            cfg = self.ssh.run(f"sudo cat {cfg_path} || cat {cfg_path}", timeout_sec=20).stdout
-
-            enabled_map = extract_enabled_from_toml(cfg)
-
-            # 2) discover installed plugins by searching dirs
-            found = set()
-            for d in PLUGIN_DIR_CANDIDATES:
-                r = self.ssh.run(f"ls -1 {d} 2>/dev/null || true")
-                for name in parse_plugins_from_ls(r.stdout):
-                    found.add(name)
-
-            # also list python packages that look like pwnagotchi plugins (optional)
-            return cfg, sorted(found), enabled_map
-
-        def done(res, err):
-            if err:
-                self._log(f"[ERROR] {err}")
-                return
-
-            cfg, installed, enabled_map = res
-            # fill table: union of installed + enabled_map keys
-            all_names = sorted(set(installed) | set(enabled_map.keys()))
-
-            self.plugins_table.setRowCount(0)
-            for i, name in enumerate(all_names):
-                self.plugins_table.insertRow(i)
-
-                item_name = QtWidgets.QTableWidgetItem(name)
-                item_inst = QtWidgets.QTableWidgetItem("yes" if name in installed else "no")
-                item_inst.setFlags(item_inst.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
-
-                chk = QtWidgets.QTableWidgetItem()
-                chk.setFlags(chk.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                chk.setCheckState(
-                    QtCore.Qt.CheckState.Checked if enabled_map.get(name, False) else QtCore.Qt.CheckState.Unchecked)
-
-                self.plugins_table.setItem(i, 0, item_name)
-                self.plugins_table.setItem(i, 1, item_inst)
-                self.plugins_table.setItem(i, 2, chk)
-
-            self._log(f"Plugins refreshed: {len(all_names)} shown.")
-
-        run_in_thread(self, do, done)
-
-    def on_plugins_apply(self):
-        cfg_path = self.cfg_path.text().strip()
-
-        # gather desired states from table
-        desired = {}
-        for row in range(self.plugins_table.rowCount()):
-            name = self.plugins_table.item(row, 0).text()
-            chk = self.plugins_table.item(row, 2)
-            desired[name] = (chk.checkState() == QtCore.Qt.CheckState.Checked)
-
-        def do():
-            # read config
-            cfg = self.ssh.run(f"sudo cat {cfg_path} || cat {cfg_path}", timeout_sec=20).stdout
-
-            # apply toggles only for plugins that appear in config or installed list
-            for name, en in desired.items():
-                cfg = set_plugin_enabled_in_toml(cfg, name, en)
-
-            # save using existing save logic approach (tmp + backup + mv)
-            tmp = "/tmp/pwnagotchi_config.toml"
-            bak = f"{cfg_path}.bak.$(date +%Y%m%d-%H%M%S)"
-            safe = cfg.replace("\\", "\\\\").replace("$", "\\$").replace("`", "\\`")
-            script = (
-                f"cat > {tmp} <<'EOF'\n{safe}\nEOF\n"
-                f"sudo cp -a {cfg_path} {bak} 2>/dev/null || true\n"
-                f"sudo mv {tmp} {cfg_path} || mv {tmp} {cfg_path}\n"
-                f"sudo systemctl restart pwnagotchi || sudo service pwnagotchi restart || true\n"
-            )
-            r = self.ssh.run(f"bash -lc {quote_bash(script)}", timeout_sec=30)
-            if r.exit_status != 0:
-                # restart might fail on non-systemd; still report file write success if possible
-                pass
-            return (r.stdout + "\n" + r.stderr).strip() or "Applied."
-
-        def done(res, err):
-            if err:
-                self._log(f"[ERROR] {err}")
-                QtWidgets.QMessageBox.critical(self, "Apply failed", str(err))
-                return
-            self._log("Applied plugin config changes.")
-            self._log(res)
-            QtWidgets.QMessageBox.information(self, "Done", "Plugin settings applied. Service restart attempted.")
-
-        run_in_thread(self, do, done)
-
-    def _tab_face(self):
-        w = QtWidgets.QWidget()
-        l = QtWidgets.QVBoxLayout(w)
-
-        top = QtWidgets.QHBoxLayout()
-        self.face_source = QtWidgets.QComboBox()
-        self.face_source.addItems([
-            "Parse last log line containing face",
-            "Use a simple status command (fallback)",
-        ])
-        self.btn_face = QtWidgets.QPushButton("Refresh face")
-        self.btn_face.clicked.connect(self.on_face_refresh)
-
-        top.addWidget(self.face_source)
-        top.addWidget(self.btn_face)
-        top.addStretch(1)
-
-        self.face_big = QtWidgets.QLabel("(-_-)")
-        f = self.face_big.font()
-        f.setPointSize(44)
-        self.face_big.setFont(f)
-        self.face_big.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-
-        self.face_info = QtWidgets.QPlainTextEdit()
-        self.face_info.setReadOnly(True)
-
-        l.addLayout(top)
-        l.addWidget(self.face_big)
-        l.addWidget(self.face_info, 1)
-
-        self.tabs.addTab(w, "Face")
-
-    def on_face_refresh(self):
-        mode = self.face_source.currentIndex()
-
-        def do():
-            if mode == 0:
-                # try logs
-                cmd = r"tail -n 400 /var/log/pwnagotchi.log 2>/dev/null | grep -Eo '\([^\)]*\)' | tail -n 1 || true"
-                r = self.ssh.run(cmd, timeout_sec=15)
-                face = r.stdout.strip()
-                # also show a small device summary
-                info = self.ssh.run("hostname; uptime -p || uptime", timeout_sec=10).stdout.strip()
-                return face, info
-            else:
-                # fallback: show service + uptime and pick a face based on state
-                s = self.ssh.run("systemctl is-active pwnagotchi 2>/dev/null || true").stdout.strip()
-                up = self.ssh.run("uptime -p || uptime", timeout_sec=10).stdout.strip()
-                face = "(^_^)" if s == "active" else "(o_O)"
-                return face, f"pwnagotchi service: {s}\n{up}"
-
-        def done(res, err):
-            if err:
-                self._log(f"[ERROR] {err}")
-                return
-            face, info = res
-            if not face:
-                face = "(._.)"
-            self.face_big.setText(face)
-            self.face_info.setPlainText(info)
-            self._log("Face refreshed.")
-
-        run_in_thread(self, do, done)
-
     def _pick_key(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select SSH private key", os.path.expanduser("~"))
         if path:
             self.keypath.setText(path)
-
-    def _pick_local(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select local file", os.path.expanduser("~"))
-        if path:
-            self.local_path.setText(path)
 
     def _set_connected(self, ok: bool):
         self.btn_connect.setEnabled(not ok)
@@ -828,7 +514,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.showMessage("Connected" if ok else "Disconnected")
 
     def _log(self, msg: str):
-        self.console.appendPlainText(msg)
+        if hasattr(self, "console") and self.console is not None:
+            self.console.appendPlainText(msg)
+        else:
+            print(msg)
 
     def on_connect(self):
         host = self.host.text().strip()
@@ -852,6 +541,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_connected(True)
             self._log("Connected.")
             self.on_refresh()
+            # refresh file manager after connect
+            if hasattr(self, "fileman"):
+                self.fileman.refresh()
 
         run_in_thread(self, do, done)
 
@@ -862,7 +554,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_refresh(self):
         def do():
-            # keep it simple + robust
             cmds = [
                 "hostname",
                 "uptime -p || uptime",
@@ -891,7 +582,6 @@ class MainWindow(QtWidgets.QMainWindow):
         name = self.service_name.currentText().strip()
 
         def do():
-            # Try systemd then SysV
             cmd = (
                 f"sudo systemctl {action} {name} || "
                 f"sudo service {name} {action} || "
@@ -955,10 +645,8 @@ class MainWindow(QtWidgets.QMainWindow):
         content = self.cfg_editor.toPlainText()
 
         def do():
-            # write to /tmp then move into place with backup
             tmp = "/tmp/pwnagotchi_config.toml"
             bak = f"{path}.bak.$(date +%Y%m%d-%H%M%S)"
-            # Use a heredoc safely
             safe = content.replace("\\", "\\\\").replace("$", "\\$").replace("`", "\\`")
             cmd = (
                 f"cat > {tmp} <<'EOF'\n{safe}\nEOF\n"
@@ -980,37 +668,85 @@ class MainWindow(QtWidgets.QMainWindow):
 
         run_in_thread(self, do, done)
 
-    def on_download(self):
-        rpath = self.remote_path.text().strip()
-        lpath = self.local_path.text().strip()
+    def on_plugins_refresh(self):
+        cfg_path = self.cfg_path.text().strip()
 
         def do():
-            self.ssh.download(rpath, lpath)
-            return f"Downloaded {rpath} -> {lpath}"
+            cfg = self.ssh.run(f"sudo cat {cfg_path} || cat {cfg_path}", timeout_sec=20).stdout
+            enabled_map = extract_enabled_from_toml(cfg)
+
+            found = set()
+            for d in PLUGIN_DIR_CANDIDATES:
+                r = self.ssh.run(f"ls -1 {d} 2>/dev/null || true")
+                for name in parse_plugins_from_ls(r.stdout):
+                    found.add(name)
+
+            return cfg, sorted(found), enabled_map
 
         def done(res, err):
             if err:
                 self._log(f"[ERROR] {err}")
-                QtWidgets.QMessageBox.critical(self, "Download failed", str(err))
                 return
-            self._log(res)
+
+            _, installed, enabled_map = res
+            all_names = sorted(set(installed) | set(enabled_map.keys()))
+
+            self.plugins_table.setRowCount(0)
+            for i, name in enumerate(all_names):
+                self.plugins_table.insertRow(i)
+
+                item_name = QtWidgets.QTableWidgetItem(name)
+                item_inst = QtWidgets.QTableWidgetItem("yes" if name in installed else "no")
+                item_inst.setFlags(item_inst.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+
+                chk = QtWidgets.QTableWidgetItem()
+                chk.setFlags(chk.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                chk.setCheckState(
+                    QtCore.Qt.CheckState.Checked if enabled_map.get(name, False) else QtCore.Qt.CheckState.Unchecked
+                )
+
+                self.plugins_table.setItem(i, 0, item_name)
+                self.plugins_table.setItem(i, 1, item_inst)
+                self.plugins_table.setItem(i, 2, chk)
+
+            self._log(f"Plugins refreshed: {len(all_names)} shown.")
 
         run_in_thread(self, do, done)
 
-    def on_upload(self):
-        rpath = self.remote_path.text().strip()
-        lpath = self.local_path.text().strip()
+    def on_plugins_apply(self):
+        cfg_path = self.cfg_path.text().strip()
+
+        desired = {}
+        for row in range(self.plugins_table.rowCount()):
+            name = self.plugins_table.item(row, 0).text()
+            chk = self.plugins_table.item(row, 2)
+            desired[name] = (chk.checkState() == QtCore.Qt.CheckState.Checked)
 
         def do():
-            self.ssh.upload(lpath, rpath)
-            return f"Uploaded {lpath} -> {rpath}"
+            cfg = self.ssh.run(f"sudo cat {cfg_path} || cat {cfg_path}", timeout_sec=20).stdout
+            for name, en in desired.items():
+                cfg = set_plugin_enabled_in_toml(cfg, name, en)
+
+            tmp = "/tmp/pwnagotchi_config.toml"
+            bak = f"{cfg_path}.bak.$(date +%Y%m%d-%H%M%S)"
+            safe = cfg.replace("\\", "\\\\").replace("$", "\\$").replace("`", "\\`")
+            script = (
+                f"cat > {tmp} <<'EOF'\n{safe}\nEOF\n"
+                f"sudo cp -a {cfg_path} {bak} 2>/dev/null || true\n"
+                f"sudo mv {tmp} {cfg_path} || mv {tmp} {cfg_path}\n"
+                f"sudo systemctl restart pwnagotchi || sudo service pwnagotchi restart || true\n"
+            )
+            r = self.ssh.run(f"bash -lc {quote_bash(script)}", timeout_sec=30)
+            return (r.stdout + "\n" + r.stderr).strip() or "Applied."
 
         def done(res, err):
             if err:
                 self._log(f"[ERROR] {err}")
-                QtWidgets.QMessageBox.critical(self, "Upload failed", str(err))
+                QtWidgets.QMessageBox.critical(self, "Apply failed", str(err))
                 return
+            self._log("Applied plugin config changes.")
             self._log(res)
+            QtWidgets.QMessageBox.information(self, "Done", "Plugin settings applied. Service restart attempted.")
 
         run_in_thread(self, do, done)
 
@@ -1019,8 +755,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         def do():
-            r = self.ssh.run("sudo reboot || reboot", timeout_sec=5)
-            return r.stdout + r.stderr
+            return (self.ssh.run("sudo reboot || reboot", timeout_sec=5).stdout or "").strip()
 
         def done(res, err):
             if err:
@@ -1036,8 +771,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         def do():
-            r = self.ssh.run("sudo shutdown -h now || shutdown -h now", timeout_sec=5)
-            return r.stdout + r.stderr
+            return (self.ssh.run("sudo shutdown -h now || shutdown -h now", timeout_sec=5).stdout or "").strip()
 
         def done(res, err):
             if err:
@@ -1047,8 +781,3 @@ class MainWindow(QtWidgets.QMainWindow):
             self.on_disconnect()
 
         run_in_thread(self, do, done)
-
-
-def quote_bash(script: str) -> str:
-    # wrap for bash -lc "...."
-    return "'" + script.replace("'", "'\"'\"'") + "'"
