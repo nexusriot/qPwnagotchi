@@ -10,6 +10,7 @@ from PyQt6 import QtWebEngineWidgets
 
 from pwnman.pwnman.ssh_client import SSHClient
 from pwnman.pwnman.ssh_terminal import SSHTerminalWidget
+from pwnman.pwnman.export_folder_tab import ExportFolderTab
 from pwnman.pwnman.file_manager import FileManagerWidget
 
 
@@ -216,6 +217,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tab_logs()
         self._tab_config()
         self._tab_files()
+        self._tab_export()
         self._tab_power()
         self._tab_ssh()
         self._tab_plugins()
@@ -795,4 +797,14 @@ class MainWindow(QtWidgets.QMainWindow):
         l.addWidget(self.term, 1)
 
         self.tabs.addTab(w, "SSH")
+
+    def _tab_export(self):
+        w = QtWidgets.QWidget()
+        l = QtWidgets.QVBoxLayout(w)
+
+        self.export_tab = ExportFolderTab(self.ssh, parent=self)
+        self.export_tab.log.connect(self._log)
+        l.addWidget(self.export_tab, 1)
+
+        self.tabs.addTab(w, "Export")
 

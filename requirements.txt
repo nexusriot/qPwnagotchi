@@ -1,3 +1,4 @@
 PyQt6==6.7.1
 paramiko==3.5.0
 PyQt6-WebEngine==6.7.0
+pyinstaller==6.17.0
