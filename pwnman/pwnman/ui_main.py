@@ -9,7 +9,9 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6 import QtWebEngineWidgets
 
 from pwnman.pwnman.ssh_client import SSHClient
+from pwnman.pwnman.ssh_terminal import SSHTerminalWidget
 from pwnman.pwnman.file_manager import FileManagerWidget
+
 
 
 # NOTE: your device may have this typo-dir:
@@ -215,7 +217,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tab_config()
         self._tab_files()
         self._tab_power()
+        self._tab_ssh()
         self._tab_plugins()
+
 
         # ensure LCD selected
         self.tabs.setCurrentIndex(0)
@@ -781,3 +785,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.on_disconnect()
 
         run_in_thread(self, do, done)
+
+    def _tab_ssh(self):
+        w = QtWidgets.QWidget()
+        l = QtWidgets.QVBoxLayout(w)
+
+        self.term = SSHTerminalWidget(self.ssh, parent=self)
+        self.term.log.connect(self._log)
+        l.addWidget(self.term, 1)
+
+        self.tabs.addTab(w, "SSH")
+
