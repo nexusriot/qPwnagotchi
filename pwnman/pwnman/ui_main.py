@@ -143,6 +143,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(980, 700)
 
         self.ssh = SSHClient()
+        self._connected = False
 
         self._build_ui()
         self._set_connected(False)
@@ -161,7 +162,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.port.setValue(22)
 
         self.user = QtWidgets.QLineEdit("pi")
-        self.passwd = QtWidgets.QLineEdit()
+        self.passwd = QtWidgets.QLineEdit("raspberry")
         self.passwd.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
 
         self.keypath = QtWidgets.QLineEdit()
@@ -300,6 +301,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(w, "LCD")
 
     def _lcd_open_web(self):
+        if not getattr(self, "_connected", False):
+            self._log("LCD Web: not connected — web view is disabled.")
+            return
+
         url = self.lcd_url.text().strip()
         if not url:
             return
@@ -307,6 +312,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lcd_web.setUrl(QtCore.QUrl(url))
 
     def _lcd_reload_now(self):
+        if not getattr(self, "_connected", False):
+            self._log("LCD Web: not connected — reload skipped.")
+            return
+
         if self.lcd_web.url().isValid():
             self.lcd_web.reload()
         else:
@@ -324,6 +333,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _lcd_web_autoreload_changed(self):
         if not hasattr(self, "_lcd_web_timer"):
             return
+
+        # do not autoreload if disconnected
+        if not getattr(self, "_connected", False):
+            self._lcd_web_timer.stop()
+            return
+
         if self.lcd_auto_reload.isChecked():
             self._lcd_web_timer.start(int(self.lcd_reload_sec.value()) * 1000)
             self._log(f"LCD Web auto reload: ON ({self.lcd_reload_sec.value()}s)")
@@ -332,6 +347,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log("LCD Web auto reload: OFF")
 
     def _lcd_web_autoreload_tick(self):
+        # do nothing while disconnected
+        if not getattr(self, "_connected", False):
+            return
+
         # avoid annoying reload while typing credentials/url
         if self.lcd_url.hasFocus() or self.lcd_user.hasFocus() or self.lcd_pass.hasFocus():
             return
@@ -513,11 +532,44 @@ class MainWindow(QtWidgets.QMainWindow):
             self.keypath.setText(path)
 
     def _set_connected(self, ok: bool):
+        self._connected = ok
+
         self.btn_connect.setEnabled(not ok)
         self.btn_disconnect.setEnabled(ok)
         for i in range(self.tabs.count()):
             self.tabs.widget(i).setEnabled(ok)
         self.status.showMessage("Connected" if ok else "Disconnected")
+
+        if hasattr(self, "_lcd_web_timer"):
+            if ok:
+                # restore state according to checkbox
+                self._lcd_web_autoreload_changed()
+            else:
+                self._lcd_web_timer.stop()
+
+        if hasattr(self, "lcd_web"):
+            if ok:
+                # show a placeholder when connected (until you open a URL)
+                self.lcd_web.setHtml(
+                    """
+                    <html>
+                      <body style="background:#000;color:#cfd8dc;font-family:monospace;
+                                   padding:24px; display:flex; flex-direction:column;
+                                   align-items:center; justify-content:center; height:100vh;">
+                        <div style="font-size:44px;font-weight:800; margin-bottom:12px;">
+                          Connected
+                        </div>
+                        <div style="font-size:22px; line-height:1.35; opacity:0.9; text-align:center;">
+                          Open the LCD web URL to start streaming.
+                        </div>
+                      </body>
+                    </html>
+                    """
+                )
+                self._lcd_apply_zoom(True)
+            else:
+                # truly blank while disconnected (no stale page)
+                self.lcd_web.setHtml("<html><body style='background:#000;'></body></html>")
 
     def _log(self, msg: str):
         if hasattr(self, "console") and self.console is not None:
