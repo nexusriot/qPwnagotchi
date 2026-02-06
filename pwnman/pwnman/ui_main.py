@@ -139,7 +139,7 @@ def quote_bash(script: str) -> str:
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Pwnagotchi Manager v.0.0.2")
+        self.setWindowTitle("Pwnagotchi Manager v.0.0.3")
         self.resize(980, 700)
 
         self.ssh = SSHClient()
@@ -243,6 +243,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.btn_lcd_open = QtWidgets.QPushButton("Open Web LCD")
         self.btn_lcd_reload = QtWidgets.QPushButton("Reload")
+        self.btn_lcd_close = QtWidgets.QPushButton("Close Web LCD")
 
         self.lcd_auto_reload = QtWidgets.QCheckBox("Auto reload")
         self.lcd_auto_reload.setChecked(True)
@@ -265,6 +266,7 @@ class MainWindow(QtWidgets.QMainWindow):
         webbar.addWidget(self.lcd_pass)
         webbar.addWidget(self.btn_lcd_open)
         webbar.addWidget(self.btn_lcd_reload)
+        webbar.addWidget(self.btn_lcd_close)
         webbar.addWidget(self.lcd_auto_reload)
         webbar.addWidget(QtWidgets.QLabel("sec:"))
         webbar.addWidget(self.lcd_reload_sec)
@@ -287,6 +289,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.btn_lcd_open.clicked.connect(self._lcd_open_web)
         self.btn_lcd_reload.clicked.connect(self._lcd_reload_now)
+        self.btn_lcd_close.clicked.connect(self._lcd_close_web)
 
         self.lcd_zoom.valueChanged.connect(lambda v: self.lcd_web.setZoomFactor(float(v)))
 
@@ -310,6 +313,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._log(f"LCD Web: opening {url}")
         self.lcd_web.setUrl(QtCore.QUrl(url))
+        self._lcd_web_autoreload_changed()
 
     def _lcd_reload_now(self):
         if not getattr(self, "_connected", False):
@@ -321,6 +325,40 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._lcd_open_web()
         self._lcd_apply_zoom(True)
+
+    def _lcd_close_web(self):
+        # stop reload loop (but do not change the checkbox state)
+        if hasattr(self, "_lcd_web_timer"):
+            self._lcd_web_timer.stop()
+
+        # clear the view (avoid showing stale page)
+        try:
+            self.lcd_web.setUrl(QtCore.QUrl("about:blank"))
+        except Exception:
+            pass
+        # show your "Connected…" placeholder only when connected, otherwise keep blank
+        if getattr(self, "_connected", False):
+            self.lcd_web.setHtml(
+                """
+                <html>
+                  <body style="background:#000;color:#cfd8dc;font-family:monospace;
+                               padding:24px; display:flex; flex-direction:column;
+                               align-items:center; justify-content:center; height:100vh;">
+                    <div style="font-size:44px;font-weight:800; margin-bottom:12px;">
+                      Connected
+                    </div>
+                    <div style="font-size:22px; line-height:1.35; opacity:0.9; text-align:center;">
+                      Open the LCD web URL to start streaming.
+                    </div>
+                  </body>
+                </html>
+                """
+            )
+            self._lcd_apply_zoom(True)
+        else:
+            self.lcd_web.setHtml("<html><body style='background:#000;'></body></html>")
+
+        self._log("LCD Web: closed")
 
     def _lcd_on_auth_required(self, url, authenticator):
         authenticator.setUser(self.lcd_user.text())
