@@ -1,0 +1,14 @@
+Package: qpwnagotchi
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: Vlad Ananyev <vlananyev@gmail.com>
+Installed-Size: @SIZE@
+Depends: libc6, libxkbcommon0, libfontconfig1, libgl1, libegl1, libdbus-1-3, libnss3, libxcb-cursor0
+Section: net
+Priority: optional
+Homepage: https://github.com/vladsever/qPwnagotchi
+Description: PyQt6 manager for your own Pwnagotchi over SSH
+ qPwnagotchi is a small desktop GUI to manage your own Pwnagotchi device
+ over SSH: status (uptime/disk/ip), service control, logs, config edit
+ with backup, SFTP upload/download, reboot/shutdown. Intentionally does
+ not provide features for offensive actions.

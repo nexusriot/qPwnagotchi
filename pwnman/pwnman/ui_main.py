@@ -12,13 +12,20 @@ from pwnman.pwnman.ssh_client import SSHClient
 from pwnman.pwnman.ssh_terminal import SSHTerminalWidget
 from pwnman.pwnman.export_folder_tab import ExportFolderTab
 from pwnman.pwnman.file_manager import FileManagerWidget
+from pwnman.pwnman.async_utils import run_in_thread, quote_bash
+from pwnman.pwnman.models import ConnectionProfile
+from pwnman.pwnman.profile_store import ProfileStore
+from pwnman.pwnman.profile_dialog import ProfileManagerDialog
+from pwnman.pwnman.fleet_tab import FleetTab
+
+MANUAL_PROFILE_LABEL = "<Manual / unsaved>"
 
 
 
 # NOTE: your device may have this typo-dir:
 # /usr/local/share/pwnagotchi/availaible-plugins
 PLUGIN_DIR_CANDIDATES = [
-    "/usr/local/share/pwnagotchi/availaible-plugins",  # <-- important for your install
+    "/usr/local/share/pwnagotchi/availaible-plugins",
     "/usr/local/share/pwnagotchi/custom-plugins",
     "/usr/local/share/pwnagotchi/installed-plugins",
     "/usr/local/share/pwnagotchi/available-plugins",
@@ -96,57 +103,21 @@ def set_plugin_enabled_in_toml(toml_text: str, plugin: str, enabled: bool) -> st
     return toml_text.rstrip() + append + "\n"
 
 
-class Worker(QtCore.QObject):
-    finished = QtCore.pyqtSignal(object, object)  # (result, error)
-
-    def __init__(self, fn, *args, **kwargs):
-        super().__init__()
-        self._fn = fn
-        self._args = args
-        self._kwargs = kwargs
-
-    @QtCore.pyqtSlot()
-    def run(self):
-        try:
-            res = self._fn(*self._args, **self._kwargs)
-            self.finished.emit(res, None)
-        except Exception as e:
-            self.finished.emit(None, e)
-
-
-def run_in_thread(parent: QtWidgets.QWidget, fn, cb, *args, **kwargs):
-    thread = QtCore.QThread(parent)
-    worker = Worker(fn, *args, **kwargs)
-    worker.moveToThread(thread)
-
-    def done(res, err):
-        thread.quit()
-        thread.wait(1000)
-        worker.deleteLater()
-        thread.deleteLater()
-        cb(res, err)
-
-    worker.finished.connect(done)
-    thread.started.connect(worker.run)
-    thread.start()
-    return thread
-
-
-def quote_bash(script: str) -> str:
-    return "'" + script.replace("'", "'\"'\"'") + "'"
-
-
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Pwnagotchi Manager v.0.0.3")
+        self.setWindowTitle("Pwnagotchi Manager v.0.1.1")
         self.resize(980, 700)
 
         self.ssh = SSHClient()
         self._connected = False
 
+        self.store = ProfileStore()
+        self._loading_profile = False
+
         self._build_ui()
         self._set_connected(False)
+        self._init_profiles()
 
     def _build_ui(self):
         root = QtWidgets.QWidget()
@@ -155,6 +126,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         conn = QtWidgets.QGroupBox("Connection")
         conn_l = QtWidgets.QGridLayout(conn)
+
+        self.profile_combo = QtWidgets.QComboBox()
+        self.profile_combo.setMinimumWidth(220)
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
+        self.btn_profile_save = QtWidgets.QPushButton("Save to profile")
+        self.btn_profile_manage = QtWidgets.QPushButton("Manage profiles…")
+        self.btn_profile_save.clicked.connect(self._on_profile_save)
+        self.btn_profile_manage.clicked.connect(self._on_profile_manage)
 
         self.host = QtWidgets.QLineEdit("10.0.0.2")
         self.port = QtWidgets.QSpinBox()
@@ -175,6 +154,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_disconnect.clicked.connect(self.on_disconnect)
 
         row = 0
+        conn_l.addWidget(QtWidgets.QLabel("Profile"), row, 0)
+        conn_l.addWidget(self.profile_combo, row, 1)
+        prof_btns = QtWidgets.QHBoxLayout()
+        prof_btns.addWidget(self.btn_profile_save)
+        prof_btns.addWidget(self.btn_profile_manage)
+        prof_btns.addStretch(1)
+        conn_l.addLayout(prof_btns, row, 2, 1, 2)
+
+        row += 1
         conn_l.addWidget(QtWidgets.QLabel("Host"), row, 0)
         conn_l.addWidget(self.host, row, 1)
         conn_l.addWidget(QtWidgets.QLabel("Port"), row, 2)
@@ -222,6 +210,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tab_power()
         self._tab_ssh()
         self._tab_plugins()
+        self._tab_fleet()
 
 
         # ensure LCD selected
@@ -564,6 +553,149 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tabs.addTab(w, "Plugins")
 
+    def _init_profiles(self):
+        """Populate the combo from the store and load the active profile."""
+        if not self.store.profiles:
+            # First run: seed a profile from the built-in defaults so the
+            # user has something to edit and connection params persist.
+            seed = self._widgets_to_profile("default")
+            self.store.upsert(seed)
+            self.store.active_name = seed.name
+            try:
+                self.store.save()
+            except OSError as e:
+                self._log(f"[WARN] Could not write profiles file: {e}")
+        self._refresh_profile_combo(select=self.store.active_name)
+
+    def _refresh_profile_combo(self, select: str = ""):
+        self._loading_profile = True
+        self.profile_combo.clear()
+        for name in self.store.names():
+            self.profile_combo.addItem(name)
+        self.profile_combo.addItem(MANUAL_PROFILE_LABEL)
+        self._loading_profile = False
+
+        idx = self.profile_combo.findText(select) if select else -1
+        if idx < 0:
+            idx = 0 if self.store.names() else self.profile_combo.findText(MANUAL_PROFILE_LABEL)
+        self.profile_combo.setCurrentIndex(idx)
+        # findText/setCurrentIndex may not emit if index unchanged; force load.
+        self._on_profile_selected(self.profile_combo.currentIndex())
+
+    def _apply_profile_to_widgets(self, p: ConnectionProfile):
+        self.host.setText(p.host)
+        self.port.setValue(int(p.port or 22))
+        self.user.setText(p.username)
+        self.passwd.setText(p.password)
+        self.keypath.setText(p.key_path)
+        if p.lcd_url:
+            self.lcd_url.setText(p.lcd_url)
+        if p.lcd_user:
+            self.lcd_user.setText(p.lcd_user)
+        if p.lcd_pass:
+            self.lcd_pass.setText(p.lcd_pass)
+
+    def _widgets_to_profile(self, name: str) -> ConnectionProfile:
+        return ConnectionProfile(
+            name=name,
+            host=self.host.text().strip(),
+            port=int(self.port.value()),
+            username=self.user.text().strip(),
+            password=self.passwd.text(),
+            key_path=self.keypath.text().strip(),
+            lcd_url=self.lcd_url.text().strip(),
+            lcd_user=self.lcd_user.text(),
+            lcd_pass=self.lcd_pass.text(),
+        )
+
+    def _on_profile_selected(self, idx: int):
+        if self._loading_profile or idx < 0:
+            return
+        name = self.profile_combo.itemText(idx)
+        if name == MANUAL_PROFILE_LABEL:
+            self.store.active_name = ""
+            return
+        p = self.store.get(name)
+        if p is None:
+            return
+
+        if self._connected:
+            if QtWidgets.QMessageBox.question(
+                self, "Switch profile",
+                f"Disconnect the current device and load profile '{name}'?",
+            ) != QtWidgets.QMessageBox.StandardButton.Yes:
+                # revert selection without reloading
+                self._loading_profile = True
+                prev = self.profile_combo.findText(self.store.active_name)
+                if prev >= 0:
+                    self.profile_combo.setCurrentIndex(prev)
+                self._loading_profile = False
+                return
+            self.on_disconnect()
+
+        self._apply_profile_to_widgets(p)
+        self.store.active_name = name
+        self._log(f"Loaded profile '{name}' ({p.username}@{p.host}:{p.port}).")
+
+    def _on_profile_save(self):
+        names = self.store.names()
+        current = self.profile_combo.currentText()
+        default_name = current if current in names else ""
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Save profile",
+            "Profile name (existing name overwrites):",
+            text=default_name,
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if not name or name == MANUAL_PROFILE_LABEL:
+            QtWidgets.QMessageBox.warning(self, "Invalid name", "Please enter a valid profile name.")
+            return
+        self.store.upsert(self._widgets_to_profile(name))
+        self.store.active_name = name
+        try:
+            self.store.save()
+        except OSError as e:
+            QtWidgets.QMessageBox.critical(self, "Save failed", f"Could not write profiles file:\n{e}")
+            return
+        self._refresh_profile_combo(select=name)
+        self._log(f"Saved profile '{name}' to {self.store.path}")
+
+    def _on_profile_manage(self):
+        dlg = ProfileManagerDialog(self.store, parent=self)
+        if dlg.exec():
+            self._refresh_profile_combo(select=dlg.selected_name)
+            self._log(f"Profiles updated ({len(self.store.names())} saved).")
+
+    def connect_profile_by_name(self, name: str):
+        """Select a profile and connect (called from the Fleet tab)."""
+        idx = self.profile_combo.findText(name)
+        if idx < 0:
+            return
+        # Selecting handles the disconnect-confirm + field load.
+        self.profile_combo.setCurrentIndex(idx)
+        if self.store.active_name != name:
+            return  # user declined to switch
+        if self._connected:
+            return  # already on this device
+        self.on_connect()
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == "Status":
+                self.tabs.setCurrentIndex(i)
+                break
+
+    def closeEvent(self, event):
+        # Persist edits made to the active profile's fields on exit.
+        active = self.store.active_name
+        if active and self.store.get(active) is not None:
+            self.store.upsert(self._widgets_to_profile(active))
+        try:
+            self.store.save()
+        except OSError as e:
+            self._log(f"[WARN] Could not write profiles file: {e}")
+        super().closeEvent(event)
+
     def _pick_key(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select SSH private key", os.path.expanduser("~"))
         if path:
@@ -574,8 +706,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.btn_connect.setEnabled(not ok)
         self.btn_disconnect.setEnabled(ok)
+        fleet = getattr(self, "_fleet_container", None)
         for i in range(self.tabs.count()):
-            self.tabs.widget(i).setEnabled(ok)
+            wdg = self.tabs.widget(i)
+            # Fleet works against saved profiles, not the active session.
+            wdg.setEnabled(True if wdg is fleet else ok)
         self.status.showMessage("Connected" if ok else "Disconnected")
 
         if hasattr(self, "_lcd_web_timer"):
@@ -897,4 +1032,12 @@ class MainWindow(QtWidgets.QMainWindow):
         l.addWidget(self.export_tab, 1)
 
         self.tabs.addTab(w, "Export")
+
+    def _tab_fleet(self):
+        w = QtWidgets.QWidget()
+        l = QtWidgets.QVBoxLayout(w)
+        self.fleet_tab = FleetTab(self.store, main_window=self, parent=self)
+        l.addWidget(self.fleet_tab, 1)
+        self._fleet_container = w
+        self.tabs.addTab(w, "Fleet")
 

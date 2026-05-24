@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=qPwnagotchi
+GenericName=Pwnagotchi Manager
+Comment=Manage your Pwnagotchi over SSH
+Exec=qpwnagotchi
+Icon=qpwnagotchi
+Terminal=false
+Categories=Network;Utility;
+Keywords=pwnagotchi;ssh;wifi;

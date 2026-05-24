@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import json
 import os
 import posixpath
+import shutil
 import stat
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional
 
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+from pwnman.pwnman.async_utils import run_in_thread
+
+ITEMS_MIME = "application/x-pwnman-items"
+MAX_EDIT_BYTES = 2 * 1024 * 1024  # refuse to load huge files into the editor
 
 
 @dataclass
@@ -16,39 +23,126 @@ class ItemRow:
     size: str  # "" for dirs
 
 
-class Worker(QtCore.QObject):
-    finished = QtCore.pyqtSignal(object, object)  # (result, error)
-
-    def __init__(self, fn, *args, **kwargs):
-        super().__init__()
-        self._fn = fn
-        self._args = args
-        self._kwargs = kwargs
-
-    @QtCore.pyqtSlot()
-    def run(self):
-        try:
-            self.finished.emit(self._fn(*self._args, **self._kwargs), None)
-        except Exception as e:
-            self.finished.emit(None, e)
+def encode_drag_payload(side: str, names: list[str]) -> bytes:
+    return json.dumps({"side": side, "names": list(names)}).encode("utf-8")
 
 
-def run_in_thread(parent: QtWidgets.QWidget, fn, cb, *args, **kwargs):
-    thread = QtCore.QThread(parent)
-    worker = Worker(fn, *args, **kwargs)
-    worker.moveToThread(thread)
+def decode_drag_payload(data: bytes) -> tuple[str, list[str]]:
+    try:
+        d = json.loads(bytes(data).decode("utf-8"))
+        side = d.get("side", "")
+        names = [str(n) for n in d.get("names", []) if isinstance(n, str)]
+        return (side if side in ("local", "remote") else ""), names
+    except (ValueError, AttributeError, TypeError):
+        return "", []
 
-    def done(res, err):
-        thread.quit()
-        thread.wait(1000)
-        worker.deleteLater()
-        thread.deleteLater()
-        cb(res, err)
 
-    worker.finished.connect(done)
-    thread.started.connect(worker.run)
-    thread.start()
-    return thread
+def looks_binary(sample: bytes) -> bool:
+    return b"\x00" in sample
+
+
+def sftp_rmtree(sftp, path: str) -> None:
+    """Recursively delete a remote path. Fixes rmdir-fails-on-non-empty."""
+    try:
+        st = sftp.lstat(path)
+    except (FileNotFoundError, OSError):
+        return
+    if stat.S_ISDIR(st.st_mode):
+        for a in sftp.listdir_attr(path):
+            sftp_rmtree(sftp, posixpath.join(path, a.filename))
+        sftp.rmdir(path)
+    else:
+        sftp.remove(path)
+
+
+class DnDTable(QtWidgets.QTableWidget):
+    """A table that drags its selected rows and accepts drops.
+
+    Emits itemsDropped(target_side, payload) where payload is either
+    ("internal", source_side, [names]) or ("external", [os_paths]).
+    """
+
+    itemsDropped = QtCore.pyqtSignal(str, object)
+
+    def __init__(self, side: str, rows: int, cols: int, parent=None):
+        super().__init__(rows, cols, parent)
+        self.side = side
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(
+            QtWidgets.QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(QtCore.Qt.DropAction.CopyAction)
+
+    def _selected_names(self) -> list[str]:
+        names = []
+        for idx in self.selectionModel().selectedRows():
+            it = self.item(idx.row(), 0)
+            if it and it.text() != "..":
+                names.append(it.text())
+        return names
+
+    def startDrag(self, supportedActions):
+        names = self._selected_names()
+        if not names:
+            return
+        md = QtCore.QMimeData()
+        md.setData(ITEMS_MIME,
+                   QtCore.QByteArray(encode_drag_payload(self.side, names)))
+        drag = QtGui.QDrag(self)
+        drag.setMimeData(md)
+        drag.exec(QtCore.Qt.DropAction.CopyAction)
+
+    def _acceptable(self, md) -> bool:
+        if md.hasFormat(ITEMS_MIME):
+            side, _ = decode_drag_payload(bytes(md.data(ITEMS_MIME)))
+            return bool(side) and side != self.side
+        return md.hasUrls()
+
+    def dragEnterEvent(self, e):
+        e.acceptProposedAction() if self._acceptable(e.mimeData()) else e.ignore()
+
+    def dragMoveEvent(self, e):
+        e.acceptProposedAction() if self._acceptable(e.mimeData()) else e.ignore()
+
+    def dropEvent(self, e):
+        md = e.mimeData()
+        if md.hasFormat(ITEMS_MIME):
+            side, names = decode_drag_payload(bytes(md.data(ITEMS_MIME)))
+            if side and side != self.side and names:
+                self.itemsDropped.emit(self.side, ("internal", side, names))
+                e.acceptProposedAction()
+                return
+        if md.hasUrls():
+            paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+            paths = [p for p in paths if p]
+            if paths:
+                self.itemsDropped.emit(self.side, ("external", paths))
+                e.acceptProposedAction()
+                return
+        e.ignore()
+
+
+class RemoteEditDialog(QtWidgets.QDialog):
+    def __init__(self, title: str, text: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(820, 600)
+        lay = QtWidgets.QVBoxLayout(self)
+        self.editor = QtWidgets.QPlainTextEdit()
+        self.editor.setPlainText(text)
+        self.editor.setFont(QtGui.QFontDatabase.systemFont(
+            QtGui.QFontDatabase.SystemFont.FixedFont))
+        lay.addWidget(self.editor, 1)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def text(self) -> str:
+        return self.editor.toPlainText()
 
 
 class FileManagerWidget(QtWidgets.QWidget):
@@ -66,17 +160,18 @@ class FileManagerWidget(QtWidgets.QWidget):
     def _build(self):
         root = QtWidgets.QVBoxLayout(self)
 
-        # Toolbar
         bar = QtWidgets.QHBoxLayout()
         self.btn_refresh = QtWidgets.QPushButton("Refresh")
         self.btn_upload = QtWidgets.QPushButton("Upload →")
         self.btn_download = QtWidgets.QPushButton("← Download")
+        self.btn_edit = QtWidgets.QPushButton("Edit remote")
         self.btn_delete = QtWidgets.QPushButton("Delete")
         self.btn_mkdir = QtWidgets.QPushButton("Mkdir")
         self.btn_rename = QtWidgets.QPushButton("Rename")
 
         for b in [self.btn_refresh, self.btn_upload, self.btn_download,
-                  self.btn_delete, self.btn_mkdir, self.btn_rename]:
+                  self.btn_edit, self.btn_delete, self.btn_mkdir,
+                  self.btn_rename]:
             bar.addWidget(b)
         bar.addStretch(1)
         root.addLayout(bar)
@@ -84,46 +179,27 @@ class FileManagerWidget(QtWidgets.QWidget):
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         root.addWidget(split, 1)
 
-        # Local (table listing)
         local_box = QtWidgets.QGroupBox("Local")
         local_l = QtWidgets.QVBoxLayout(local_box)
-
         self.local_path_label = QtWidgets.QLabel(self.local_dir)
         local_l.addWidget(self.local_path_label)
-
-        self.local_view = QtWidgets.QTableWidget(0, 3)
-        self.local_view.setHorizontalHeaderLabels(["Name", "Type", "Size"])
-        self.local_view.horizontalHeader().setStretchLastSection(True)
-        self.local_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.local_view.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self.local_view.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.local_view = self._make_table("local")
         self.local_view.cellDoubleClicked.connect(self._local_double_click)
         local_l.addWidget(self.local_view, 1)
-
         split.addWidget(local_box)
 
-        # Remote (SFTP)
         remote_box = QtWidgets.QGroupBox("Remote (SFTP)")
         remote_l = QtWidgets.QVBoxLayout(remote_box)
-
         self.remote_path_label = QtWidgets.QLabel(self.remote_dir)
         remote_l.addWidget(self.remote_path_label)
-
-        self.remote_view = QtWidgets.QTableWidget(0, 3)
-        self.remote_view.setHorizontalHeaderLabels(["Name", "Type", "Size"])
-        self.remote_view.horizontalHeader().setStretchLastSection(True)
-        self.remote_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.remote_view.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self.remote_view.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.remote_view = self._make_table("remote")
         self.remote_view.cellDoubleClicked.connect(self._remote_double_click)
         remote_l.addWidget(self.remote_view, 1)
-
         split.addWidget(remote_box)
 
         split.setStretchFactor(0, 2)
         split.setStretchFactor(1, 2)
 
-        # Progress
         p = QtWidgets.QHBoxLayout()
         self.transfer_label = QtWidgets.QLabel("Idle")
         self.transfer_bar = QtWidgets.QProgressBar()
@@ -133,101 +209,80 @@ class FileManagerWidget(QtWidgets.QWidget):
         p.addWidget(self.transfer_bar, 1)
         root.addLayout(p)
 
-        # Wiring
         self.btn_refresh.clicked.connect(self.refresh)
         self.btn_upload.clicked.connect(self.upload_selected)
         self.btn_download.clicked.connect(self.download_selected)
+        self.btn_edit.clicked.connect(self.edit_selected_remote)
         self.btn_delete.clicked.connect(self.delete_selected_remote)
         self.btn_mkdir.clicked.connect(self.mkdir_remote)
         self.btn_rename.clicked.connect(self.rename_selected_remote)
 
-        # Initial local listing
         self._local_refresh()
+
+    def _make_table(self, side: str) -> DnDTable:
+        t = DnDTable(side, 0, 3)
+        t.setHorizontalHeaderLabels(["Name", "Type", "Size"])
+        t.horizontalHeader().setStretchLastSection(True)
+        t.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        t.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        t.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.itemsDropped.connect(self._on_drop)
+        return t
 
     def _local_list_dir(self, path: str) -> list[ItemRow]:
         rows: list[ItemRow] = []
         if os.path.abspath(path) != os.path.abspath(os.path.sep):
             rows.append(ItemRow("..", "dir", ""))
-
         try:
             with os.scandir(path) as it:
                 for e in it:
                     try:
                         is_dir = e.is_dir(follow_symlinks=False)
-                    except Exception:
+                    except OSError:
                         is_dir = False
                     typ = "dir" if is_dir else "file"
                     size = ""
                     if not is_dir:
                         try:
                             size = str(e.stat(follow_symlinks=False).st_size)
-                        except Exception:
+                        except OSError:
                             size = ""
                     rows.append(ItemRow(e.name, typ, size))
-        except Exception:
+        except OSError:
             pass
-
         rows.sort(key=lambda x: (x.typ != "dir", x.name.lower()))
         return rows
 
+    def _fill(self, table: QtWidgets.QTableWidget, rows: list[ItemRow]):
+        table.setRowCount(0)
+        for i, it in enumerate(rows):
+            table.insertRow(i)
+            table.setItem(i, 0, QtWidgets.QTableWidgetItem(it.name))
+            table.setItem(i, 1, QtWidgets.QTableWidgetItem(it.typ))
+            table.setItem(i, 2, QtWidgets.QTableWidgetItem(it.size))
+
     def _local_refresh(self):
         self.local_path_label.setText(self.local_dir)
-        rows = self._local_list_dir(self.local_dir)
-
-        self.local_view.setRowCount(0)
-        for i, it in enumerate(rows):
-            self.local_view.insertRow(i)
-            self.local_view.setItem(i, 0, QtWidgets.QTableWidgetItem(it.name))
-            self.local_view.setItem(i, 1, QtWidgets.QTableWidgetItem(it.typ))
-            self.local_view.setItem(i, 2, QtWidgets.QTableWidgetItem(it.size))
+        self._fill(self.local_view, self._local_list_dir(self.local_dir))
 
     def _local_double_click(self, row: int, col: int):
         name_item = self.local_view.item(row, 0)
         typ_item = self.local_view.item(row, 1)
-        if not name_item or not typ_item:
+        if not name_item or not typ_item or typ_item.text() != "dir":
             return
-
         name = name_item.text()
-        typ = typ_item.text()
-        if typ != "dir":
-            return
-
         if name == "..":
-            parent = os.path.dirname(self.local_dir.rstrip(os.sep)) or os.sep
-            self.local_dir = parent
+            self.local_dir = os.path.dirname(
+                self.local_dir.rstrip(os.sep)) or os.sep
         else:
             self.local_dir = os.path.join(self.local_dir, name)
-
         self._local_refresh()
-
-    def _selected_local(self) -> Optional[Tuple[str, str]]:
-        r = self.local_view.currentRow()
-        if r < 0:
-            return None
-        name_item = self.local_view.item(r, 0)
-        typ_item = self.local_view.item(r, 1)
-        if not name_item or not typ_item:
-            return None
-        name = name_item.text()
-        typ = typ_item.text()
-        if name == "..":
-            return None
-        return os.path.join(self.local_dir, name), typ
-
-    def _selected_remote(self) -> Optional[tuple[str, str]]:
-        r = self.remote_view.currentRow()
-        if r < 0:
-            return None
-        name_item = self.remote_view.item(r, 0)
-        typ_item = self.remote_view.item(r, 1)
-        if not name_item or not typ_item:
-            return None
-        return name_item.text(), typ_item.text()
 
     def refresh(self):
-        # always refresh local
         self._local_refresh()
-
         if not getattr(self.ssh, "connected", False):
             return
 
@@ -236,13 +291,11 @@ class FileManagerWidget(QtWidgets.QWidget):
             rows: list[ItemRow] = []
             if self.remote_dir != "/":
                 rows.append(ItemRow("..", "dir", ""))
-
             for a in sftp.listdir_attr(self.remote_dir):
                 is_dir = stat.S_ISDIR(a.st_mode)
                 typ = "dir" if is_dir else "file"
                 size = "" if is_dir else str(int(getattr(a, "st_size", 0)))
                 rows.append(ItemRow(a.filename, typ, size))
-
             rows.sort(key=lambda x: (x.typ != "dir", x.name.lower()))
             return rows
 
@@ -251,12 +304,7 @@ class FileManagerWidget(QtWidgets.QWidget):
                 self.log.emit(f"[ERROR] Files refresh: {err}")
                 return
             self.remote_path_label.setText(self.remote_dir)
-            self.remote_view.setRowCount(0)
-            for i, it in enumerate(res):
-                self.remote_view.insertRow(i)
-                self.remote_view.setItem(i, 0, QtWidgets.QTableWidgetItem(it.name))
-                self.remote_view.setItem(i, 1, QtWidgets.QTableWidgetItem(it.typ))
-                self.remote_view.setItem(i, 2, QtWidgets.QTableWidgetItem(it.size))
+            self._fill(self.remote_view, res)
             self.log.emit("Files refreshed.")
 
         run_in_thread(self, do, done)
@@ -268,34 +316,56 @@ class FileManagerWidget(QtWidgets.QWidget):
             return
         name = name_item.text()
         typ = typ_item.text()
-
         if name == "..":
-            self.remote_dir = posixpath.dirname(self.remote_dir.rstrip("/")) or "/"
+            self.remote_dir = posixpath.dirname(
+                self.remote_dir.rstrip("/")) or "/"
             self.refresh()
             return
-
         if typ == "dir":
             self.remote_dir = posixpath.join(self.remote_dir, name)
             self.refresh()
 
+    def _selected_local_many(self) -> list[tuple[str, str]]:
+        out = []
+        for idx in self.local_view.selectionModel().selectedRows():
+            r = idx.row()
+            n = self.local_view.item(r, 0)
+            t = self.local_view.item(r, 1)
+            if n and t and n.text() != "..":
+                out.append((os.path.join(self.local_dir, n.text()), t.text()))
+        return out
+
+    def _selected_remote_many(self) -> list[tuple[str, str]]:
+        out = []
+        for idx in self.remote_view.selectionModel().selectedRows():
+            r = idx.row()
+            n = self.remote_view.item(r, 0)
+            t = self.remote_view.item(r, 1)
+            if n and t and n.text() != "..":
+                out.append((n.text(), t.text()))
+        return out
+
+    def _remote_type_of(self, name: str) -> str:
+        for r in range(self.remote_view.rowCount()):
+            n = self.remote_view.item(r, 0)
+            if n and n.text() == name:
+                t = self.remote_view.item(r, 1)
+                return t.text() if t else "file"
+        return "file"
+
     def _ui_set_progress(self, value: int):
         QtCore.QMetaObject.invokeMethod(
-            self.transfer_bar,
-            "setValue",
+            self.transfer_bar, "setValue",
             QtCore.Qt.ConnectionType.QueuedConnection,
-            QtCore.Q_ARG(int, int(value)),
-        )
+            QtCore.Q_ARG(int, int(value)))
 
     def _ui_set_label(self, text: str):
         QtCore.QMetaObject.invokeMethod(
-            self.transfer_label,
-            "setText",
+            self.transfer_label, "setText",
             QtCore.Qt.ConnectionType.QueuedConnection,
-            QtCore.Q_ARG(str, text),
-        )
+            QtCore.Q_ARG(str, text))
 
     def _sftp_mkdir_p(self, sftp, path: str):
-        # posix mkdir -p
         parts = []
         p = path
         while p not in ("", "/"):
@@ -304,20 +374,19 @@ class FileManagerWidget(QtWidgets.QWidget):
         for d in reversed(parts):
             try:
                 sftp.stat(d)
-            except Exception:
+            except OSError:
                 try:
                     sftp.mkdir(d)
-                except Exception:
+                except OSError:
                     pass
 
     def _local_total_bytes(self, src: str) -> int:
         total = 0
-        for root, dirs, files in os.walk(src):
+        for root, _dirs, files in os.walk(src):
             for f in files:
-                fp = os.path.join(root, f)
                 try:
-                    total += os.path.getsize(fp)
-                except Exception:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
                     pass
         return total
 
@@ -333,143 +402,115 @@ class FileManagerWidget(QtWidgets.QWidget):
                 else:
                     try:
                         total += int(getattr(a, "st_size", 0) or 0)
-                    except Exception:
+                    except (TypeError, ValueError):
                         pass
 
         walk(src)
         return total
 
-    def _download_folder(self, sftp, remote_src: str, local_dst: str):
-        os.makedirs(local_dst, exist_ok=True)
-        for a in sftp.listdir_attr(remote_src):
-            rpath = posixpath.join(remote_src, a.filename)
-            lpath = os.path.join(local_dst, a.filename)
-            if stat.S_ISDIR(a.st_mode):
-                self._download_folder(sftp, rpath, lpath)
-            else:
-                sftp.get(rpath, lpath)
-
-    def _upload_folder(self, sftp, local_src: str, remote_dst: str):
-        self._sftp_mkdir_p(sftp, remote_dst)
-        for root, dirs, files in os.walk(local_src):
-            rel = os.path.relpath(root, local_src)
-            rdir = remote_dst if rel == "." else posixpath.join(remote_dst, rel.replace(os.sep, "/"))
-            self._sftp_mkdir_p(sftp, rdir)
-
-            for d in dirs:
-                self._sftp_mkdir_p(sftp, posixpath.join(rdir, d))
-
-            for f in files:
-                lp = os.path.join(root, f)
-                rp = posixpath.join(rdir, f)
-                sftp.put(lp, rp)
-
-    def _start_transfer_any(self, direction: str, local_path: str, remote_path: str, is_dir: bool):
-        if not getattr(self.ssh, "connected", False):
+    def _start_batch_transfer(self, direction: str,
+                              entries: list[tuple[str, str, bool]]):
+        """entries: list of (local_path, remote_path, is_dir)."""
+        if not getattr(self.ssh, "connected", False) or not entries:
             return
 
         self.transfer_bar.setRange(0, 100)
         self.transfer_bar.setValue(0)
-
-        base = os.path.basename(local_path if direction == "upload" else remote_path)
-        self.transfer_label.setText(f"{direction}: {base}")
+        self.transfer_label.setText(f"{direction}: {len(entries)} item(s)")
 
         def do():
             sftp = self.ssh.sftp()
 
-            # try “overall bytes” progress; if it fails -> fallback to “file count”
             overall_total = 0
-            try:
-                if is_dir:
-                    if direction == "upload":
-                        overall_total = self._local_total_bytes(local_path)
+            for lp, rp, is_dir in entries:
+                try:
+                    if is_dir:
+                        overall_total += (
+                            self._local_total_bytes(lp)
+                            if direction == "upload"
+                            else self._remote_total_bytes(sftp, rp))
                     else:
-                        overall_total = self._remote_total_bytes(sftp, remote_path)
-                else:
-                    if direction == "upload":
-                        overall_total = os.path.getsize(local_path)
-                    else:
-                        overall_total = int(sftp.stat(remote_path).st_size)
-            except Exception:
-                overall_total = 0
+                        overall_total += (
+                            os.path.getsize(lp) if direction == "upload"
+                            else int(sftp.stat(rp).st_size))
+                except OSError:
+                    pass
 
             overall_done = 0
 
             def report(delta: int, current: str):
                 nonlocal overall_done
                 overall_done += max(0, delta)
+                self._ui_set_label(f"{direction}: {current}")
                 if overall_total > 0:
-                    pct = int(overall_done * 100 / overall_total)
-                    pct = 100 if pct > 100 else pct
-                    self._ui_set_label(f"{direction}: {current}")
+                    pct = min(100, int(overall_done * 100 / overall_total))
                     self._ui_set_progress(pct)
                 else:
-                    # unknown total => indeterminate-ish progress by “pulse”
-                    self._ui_set_label(f"{direction}: {current}")
-                    # move a bit but clamp
                     cur = self.transfer_bar.value()
                     self._ui_set_progress(100 if cur >= 95 else cur + 5)
 
-            if not is_dir:
-                # single file with callback
-                def cb(done: int, total: int):
-                    if total > 0:
-                        pct = int(done * 100 / total)
-                        self._ui_set_label(f"{direction}: {os.path.basename(remote_path)}")
-                        self._ui_set_progress(pct)
+            for lp, rp, is_dir in entries:
+                if not is_dir:
+                    base = overall_done
+
+                    def cb(d, t, _b=base, _n=os.path.basename(rp)):
+                        if overall_total > 0:
+                            pct = min(100, int((_b + d) * 100 / overall_total))
+                            self._ui_set_label(f"{direction}: {_n}")
+                            self._ui_set_progress(pct)
+
+                    if direction == "download":
+                        os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
+                        sftp.get(rp, lp, callback=cb)
+                        try:
+                            report(int(sftp.stat(rp).st_size), os.path.basename(rp))
+                        except OSError:
+                            report(0, os.path.basename(rp))
+                    else:
+                        self._sftp_mkdir_p(sftp, posixpath.dirname(rp))
+                        sftp.put(lp, rp, callback=cb)
+                        try:
+                            report(os.path.getsize(lp), os.path.basename(lp))
+                        except OSError:
+                            report(0, os.path.basename(lp))
+                    continue
 
                 if direction == "download":
-                    sftp.get(remote_path, local_path, callback=cb)
+                    def walk_dl(rsrc, ldst):
+                        os.makedirs(ldst, exist_ok=True)
+                        for a in sftp.listdir_attr(rsrc):
+                            rp2 = posixpath.join(rsrc, a.filename)
+                            lp2 = os.path.join(ldst, a.filename)
+                            if stat.S_ISDIR(a.st_mode):
+                                walk_dl(rp2, lp2)
+                            else:
+                                report(0, a.filename)
+                                sftp.get(rp2, lp2)
+                                report(int(getattr(a, "st_size", 0) or 0),
+                                       a.filename)
+                    walk_dl(rp, lp)
                 else:
-                    sftp.put(local_path, remote_path, callback=cb)
-                return True
-
-            # folder: walk files and update “overall bytes” by file sizes
-            if direction == "download":
-                os.makedirs(local_path, exist_ok=True)
-
-                def walk_download(rsrc: str, ldst: str):
-                    nonlocal overall_done
-                    os.makedirs(ldst, exist_ok=True)
-                    for a in sftp.listdir_attr(rsrc):
-                        rp = posixpath.join(rsrc, a.filename)
-                        lp = os.path.join(ldst, a.filename)
-                        if stat.S_ISDIR(a.st_mode):
-                            walk_download(rp, lp)
-                        else:
-                            report(0, f"{a.filename}")
-                            sftp.get(rp, lp)
-                            try:
-                                report(int(getattr(a, "st_size", 0) or 0), f"{a.filename}")
-                            except Exception:
-                                pass
-
-                walk_download(remote_path, local_path)
-
-            else:
-                # upload
-                def walk_upload(lsrc: str, rdst: str):
-                    nonlocal overall_done
-                    self._sftp_mkdir_p(sftp, rdst)
-                    for root, dirs, files in os.walk(lsrc):
-                        rel = os.path.relpath(root, lsrc)
-                        rdir = rdst if rel == "." else posixpath.join(rdst, rel.replace(os.sep, "/"))
-                        self._sftp_mkdir_p(sftp, rdir)
-
-                        for d in dirs:
-                            self._sftp_mkdir_p(sftp, posixpath.join(rdir, d))
-
-                        for f in files:
-                            lp = os.path.join(root, f)
-                            rp = posixpath.join(rdir, f)
-                            report(0, f)
-                            sftp.put(lp, rp)
-                            try:
-                                report(os.path.getsize(lp), f)
-                            except Exception:
-                                pass
-
-                walk_upload(local_path, remote_path)
+                    def walk_ul(lsrc, rdst):
+                        self._sftp_mkdir_p(sftp, rdst)
+                        for root, dirs, files in os.walk(lsrc):
+                            rel = os.path.relpath(root, lsrc)
+                            rdir = (rdst if rel == "."
+                                    else posixpath.join(
+                                        rdst, rel.replace(os.sep, "/")))
+                            self._sftp_mkdir_p(sftp, rdir)
+                            for d in dirs:
+                                self._sftp_mkdir_p(
+                                    sftp, posixpath.join(rdir, d))
+                            for f in files:
+                                report(0, f)
+                                sftp.put(os.path.join(root, f),
+                                         posixpath.join(rdir, f))
+                                try:
+                                    report(os.path.getsize(
+                                        os.path.join(root, f)), f)
+                                except OSError:
+                                    pass
+                    walk_ul(lp, rp)
 
             self._ui_set_progress(100)
             return True
@@ -478,7 +519,8 @@ class FileManagerWidget(QtWidgets.QWidget):
             if err:
                 self.transfer_label.setText(f"Error: {err}")
                 self.log.emit(f"[ERROR] Transfer: {err}")
-                QtWidgets.QMessageBox.critical(self, "Transfer failed", str(err))
+                QtWidgets.QMessageBox.critical(
+                    self, "Transfer failed", str(err))
                 return
             self.transfer_bar.setValue(100)
             self.transfer_label.setText("Done.")
@@ -488,58 +530,165 @@ class FileManagerWidget(QtWidgets.QWidget):
         run_in_thread(self, do, done)
 
     def upload_selected(self):
-        sel = self._selected_local()
+        sel = self._selected_local_many()
         if not sel:
-            QtWidgets.QMessageBox.information(self, "Upload", "Select a local file or folder.")
+            QtWidgets.QMessageBox.information(
+                self, "Upload", "Select local file(s) or folder(s).")
             return
-        lp, typ = sel
-        name = os.path.basename(lp)
-        rp = posixpath.join(self.remote_dir, name)
-        self._start_transfer_any("upload", lp, rp, is_dir=(typ == "dir"))
+        entries = [
+            (lp, posixpath.join(self.remote_dir, os.path.basename(lp)),
+             typ == "dir")
+            for lp, typ in sel
+        ]
+        self._start_batch_transfer("upload", entries)
 
     def download_selected(self):
-        sel = self._selected_remote()
+        sel = self._selected_remote_many()
         if not sel:
+            QtWidgets.QMessageBox.information(
+                self, "Download", "Select remote file(s) or folder(s).")
             return
-        name, typ = sel
-        if name == "..":
+        entries = [
+            (os.path.join(self.local_dir, name),
+             posixpath.join(self.remote_dir, name), typ == "dir")
+            for name, typ in sel
+        ]
+        self._start_batch_transfer("download", entries)
+
+    def _on_drop(self, target_side: str, payload):
+        kind = payload[0]
+        if kind == "internal":
+            _, source_side, names = payload
+            if source_side == "local" and target_side == "remote":
+                entries = [
+                    (os.path.join(self.local_dir, n),
+                     posixpath.join(self.remote_dir, n),
+                     os.path.isdir(os.path.join(self.local_dir, n)))
+                    for n in names
+                ]
+                self._start_batch_transfer("upload", entries)
+            elif source_side == "remote" and target_side == "local":
+                entries = [
+                    (os.path.join(self.local_dir, n),
+                     posixpath.join(self.remote_dir, n),
+                     self._remote_type_of(n) == "dir")
+                    for n in names
+                ]
+                self._start_batch_transfer("download", entries)
             return
-        rp = posixpath.join(self.remote_dir, name)
-        lp = os.path.join(self.local_dir, name)
-        self._start_transfer_any("download", lp, rp, is_dir=(typ == "dir"))
+
+        # external OS-file drop
+        paths = payload[1]
+        if target_side == "remote":
+            entries = [
+                (p, posixpath.join(self.remote_dir, os.path.basename(
+                    p.rstrip("/\\"))), os.path.isdir(p))
+                for p in paths
+            ]
+            self._start_batch_transfer("upload", entries)
+        else:
+            copied = 0
+            for p in paths:
+                try:
+                    dst = os.path.join(
+                        self.local_dir, os.path.basename(p.rstrip("/\\")))
+                    if os.path.isdir(p):
+                        shutil.copytree(p, dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(p, dst)
+                    copied += 1
+                except OSError as e:
+                    self.log.emit(f"[ERROR] Copy {p}: {e}")
+            if copied:
+                self.log.emit(f"Copied {copied} item(s) into {self.local_dir}")
+                self._local_refresh()
 
     def delete_selected_remote(self):
-        sel = self._selected_remote()
+        sel = self._selected_remote_many()
         if not sel:
+            QtWidgets.QMessageBox.information(
+                self, "Delete", "Select remote item(s).")
             return
-        name, typ = sel
-        if name == "..":
+        listing = "\n  ".join(f"{t}: {n}" for n, t in sel)
+        if QtWidgets.QMessageBox.question(
+            self, "Delete",
+            f"Delete {len(sel)} remote item(s) (recursive)?\n\n  {listing}",
+        ) != QtWidgets.QMessageBox.StandardButton.Yes:
             return
-        path = posixpath.join(self.remote_dir, name)
-
-        if QtWidgets.QMessageBox.question(self, "Delete", f"Delete remote {typ}: {path}?") != QtWidgets.QMessageBox.StandardButton.Yes:
-            return
+        paths = [posixpath.join(self.remote_dir, n) for n, _ in sel]
 
         def do():
             sftp = self.ssh.sftp()
-            if typ == "dir":
-                sftp.rmdir(path)
-            else:
-                sftp.remove(path)
-            return True
+            for path in paths:
+                sftp_rmtree(sftp, path)
+            return len(paths)
 
         def done(res, err):
             if err:
                 self.log.emit(f"[ERROR] Delete: {err}")
-                QtWidgets.QMessageBox.critical(self, "Delete failed", str(err))
+                QtWidgets.QMessageBox.critical(
+                    self, "Delete failed", str(err))
                 return
-            self.log.emit("Deleted.")
+            self.log.emit(f"Deleted {res} item(s).")
             self.refresh()
 
         run_in_thread(self, do, done)
 
+    def edit_selected_remote(self):
+        sel = self._selected_remote_many()
+        files = [n for n, t in sel if t == "file"]
+        if len(sel) != 1 or len(files) != 1:
+            QtWidgets.QMessageBox.information(
+                self, "Edit", "Select exactly one remote file.")
+            return
+        name = files[0]
+        path = posixpath.join(self.remote_dir, name)
+
+        def do():
+            sftp = self.ssh.sftp()
+            size = int(sftp.stat(path).st_size)
+            if size > MAX_EDIT_BYTES:
+                raise RuntimeError(
+                    f"File too large to edit ({size} bytes, "
+                    f"limit {MAX_EDIT_BYTES}).")
+            with sftp.open(path, "rb") as fh:
+                data = fh.read()
+            if looks_binary(data[:8192]):
+                raise RuntimeError("File appears to be binary.")
+            return data.decode("utf-8", errors="replace")
+
+        def done(res, err):
+            if err:
+                self.log.emit(f"[ERROR] Edit load: {err}")
+                QtWidgets.QMessageBox.critical(self, "Edit failed", str(err))
+                return
+            dlg = RemoteEditDialog(f"Edit: {path}", res, self)
+            if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return
+            new_text = dlg.text()
+
+            def save():
+                sftp = self.ssh.sftp()
+                with sftp.open(path, "wb") as fh:
+                    fh.write(new_text.encode("utf-8"))
+                return True
+
+            def saved(_r, e2):
+                if e2:
+                    self.log.emit(f"[ERROR] Edit save: {e2}")
+                    QtWidgets.QMessageBox.critical(
+                        self, "Save failed", str(e2))
+                    return
+                self.log.emit(f"Saved {path}")
+                self.refresh()
+
+            run_in_thread(self, save, saved)
+
+        run_in_thread(self, do, done)
+
     def mkdir_remote(self):
-        name, ok = QtWidgets.QInputDialog.getText(self, "Mkdir", "Remote folder name:")
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Mkdir", "Remote folder name:")
         if not ok or not name.strip():
             return
         path = posixpath.join(self.remote_dir, name.strip())
@@ -559,17 +708,16 @@ class FileManagerWidget(QtWidgets.QWidget):
         run_in_thread(self, do, done)
 
     def rename_selected_remote(self):
-        sel = self._selected_remote()
-        if not sel:
+        sel = self._selected_remote_many()
+        if len(sel) != 1:
+            QtWidgets.QMessageBox.information(
+                self, "Rename", "Select exactly one remote item.")
             return
-        name, typ = sel
-        if name == "..":
-            return
-
-        newname, ok = QtWidgets.QInputDialog.getText(self, "Rename", f"New name for {name}:")
+        name, _typ = sel[0]
+        newname, ok = QtWidgets.QInputDialog.getText(
+            self, "Rename", f"New name for {name}:")
         if not ok or not newname.strip():
             return
-
         oldp = posixpath.join(self.remote_dir, name)
         newp = posixpath.join(self.remote_dir, newname.strip())
 

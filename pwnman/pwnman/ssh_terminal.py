@@ -2,40 +2,7 @@ from __future__ import annotations
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-
-class Worker(QtCore.QObject):
-    finished = QtCore.pyqtSignal(object, object)  # (result, error)
-
-    def __init__(self, fn, *args, **kwargs):
-        super().__init__()
-        self._fn = fn
-        self._args = args
-        self._kwargs = kwargs
-
-    @QtCore.pyqtSlot()
-    def run(self):
-        try:
-            self.finished.emit(self._fn(*self._args, **self._kwargs), None)
-        except Exception as e:
-            self.finished.emit(None, e)
-
-
-def run_in_thread(parent: QtWidgets.QWidget, fn, cb, *args, **kwargs):
-    thread = QtCore.QThread(parent)
-    worker = Worker(fn, *args, **kwargs)
-    worker.moveToThread(thread)
-
-    def done(res, err):
-        thread.quit()
-        thread.wait(1000)
-        worker.deleteLater()
-        thread.deleteLater()
-        cb(res, err)
-
-    worker.finished.connect(done)
-    thread.started.connect(worker.run)
-    thread.start()
-    return thread
+from pwnman.pwnman.async_utils import run_in_thread, quote_bash
 
 
 class SSHTerminalWidget(QtWidgets.QWidget):
@@ -177,7 +144,3 @@ class SSHTerminalWidget(QtWidgets.QWidget):
             self.cwd.setText(res)
 
         run_in_thread(self, do, done)
-
-
-def quote_bash(script: str) -> str:
-    return "'" + script.replace("'", "'\"'\"'") + "'"

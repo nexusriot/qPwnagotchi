@@ -3,4 +3,6 @@
 
 build/
 dist/
-app.spec
+*.spec
+__pycache__/
+*.pyc

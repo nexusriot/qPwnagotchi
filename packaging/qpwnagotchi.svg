@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f6feb"/>
+      <stop offset="1" stop-color="#0b2a52"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4f1c1"/>
+      <stop offset="1" stop-color="#c9c389"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+      <feOffset dx="0" dy="3" result="off"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.35"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- rounded square background -->
+  <rect x="8" y="8" width="240" height="240" rx="44" ry="44" fill="url(#bg)"/>
+
+  <!-- antenna -->
+  <line x1="128" y1="44" x2="128" y2="20" stroke="#e6edf3" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="128" cy="16" r="8" fill="#ff5d5d" stroke="#e6edf3" stroke-width="3"/>
+
+  <!-- wifi waves -->
+  <g fill="none" stroke="#9ad1ff" stroke-width="5" stroke-linecap="round" opacity="0.85">
+    <path d="M 38 96 q 18 -22 44 -22"/>
+    <path d="M 24 78 q 28 -34 68 -34"/>
+    <path d="M 218 96 q -18 -22 -44 -22" />
+    <path d="M 232 78 q -28 -34 -68 -34" />
+  </g>
+
+  <!-- device body (e-ink screen frame) -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="62" width="176" height="148" rx="18" ry="18" fill="#11161f" stroke="#2a3140" stroke-width="3"/>
+    <!-- screen -->
+    <rect x="56" y="78" width="144" height="104" rx="6" ry="6" fill="url(#screen)"/>
+
+    <!-- pwnagotchi face: (◕‿‿◕) -->
+    <g fill="#11161f">
+      <!-- left eye -->
+      <circle cx="92" cy="120" r="13"/>
+      <circle cx="96" cy="116" r="4" fill="#f4f1c1"/>
+      <!-- right eye -->
+      <circle cx="164" cy="120" r="13"/>
+      <circle cx="168" cy="116" r="4" fill="#f4f1c1"/>
+      <!-- mouth: ‿‿ -->
+      <path d="M 110 148 q 9 12 18 0 q 9 -12 18 0" fill="none" stroke="#11161f" stroke-width="5" stroke-linecap="round"/>
+    </g>
+
+    <!-- status bar at top of screen -->
+    <rect x="56" y="78" width="144" height="12" fill="#11161f" opacity="0.85"/>
+    <text x="62" y="87" font-family="monospace" font-size="9" fill="#f4f1c1">PWN!</text>
+    <text x="178" y="87" font-family="monospace" font-size="9" fill="#f4f1c1" text-anchor="end">CH 6</text>
+
+    <!-- buttons / speaker grille below screen -->
+    <g fill="#2a3140">
+      <circle cx="76" cy="196" r="4"/>
+      <circle cx="92" cy="196" r="4"/>
+      <circle cx="108" cy="196" r="4"/>
+    </g>
+    <rect x="150" y="192" width="50" height="8" rx="2" fill="#2a3140"/>
+  </g>
+
+  <!-- subtle highlight -->
+  <rect x="8" y="8" width="240" height="120" rx="44" ry="44" fill="#ffffff" opacity="0.04"/>
+</svg>
