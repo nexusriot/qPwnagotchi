@@ -4,7 +4,7 @@ import copy
 import os
 from typing import Optional
 
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtWidgets
 
 from pwnman.pwnman.models import ConnectionProfile
 from pwnman.pwnman.profile_store import ProfileStore

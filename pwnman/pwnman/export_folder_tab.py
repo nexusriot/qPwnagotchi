@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import time
 from PyQt6 import QtCore, QtWidgets
 

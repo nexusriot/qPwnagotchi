@@ -1,14 +1,8 @@
 #!/usr/bin/env bash
-# Build a single-file PyInstaller binary for the host architecture.
+# Build a single-file PyInstaller binary for the host (or container) arch.
 #
-# PyInstaller does NOT cross-compile. The output binary is for whichever
-# arch this script runs on. To get a binary for uConsole (arm64/armhf),
-# run this *on the uConsole*, or inside a matching docker/qemu container,
-# e.g.:
-#
-#   docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src \
-#       debian:bookworm bash -lc \
-#       'apt-get update && apt-get install -y python3-venv python3-pip make && make build'
+# PyInstaller does NOT cross-compile; use `make linux-arm64` (docker + qemu)
+# for other architectures.
 #
 # Output: dist/qpwnagotchi-<version>-<arch>
 set -euo pipefail
@@ -16,7 +10,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 APP_NAME="${APP_NAME:-qpwnagotchi}"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-$(./scripts/version.sh)}"
 ARCH="${ARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}"
 
 VENV="${VENV:-.venv}"
@@ -27,18 +21,28 @@ if [ ! -x "$PYI" ]; then
     exit 1
 fi
 
-# Build. --onefile makes one self-contained binary; --windowed hides the
-# console window (irrelevant on Linux but matches existing app.spec).
+# Bundle the icons (resources.py looks in sys._MEIPASS/packaging) and the
+# QtSvg plugin used for the SVG icon.
 "$PYI" \
     --noconfirm \
     --clean \
     --onefile \
     --windowed \
     --name "${APP_NAME}" \
+    --add-data "packaging/qpwnagotchi.svg:packaging" \
+    --add-data "packaging/qpwnagotchi-256.png:packaging" \
+    --add-data "packaging/qpwnagotchi-128.png:packaging" \
+    --add-data "packaging/qpwnagotchi-64.png:packaging" \
+    --add-data "packaging/qpwnagotchi-48.png:packaging" \
+    --add-data "packaging/qpwnagotchi-32.png:packaging" \
+    --add-data "packaging/qpwnagotchi-16.png:packaging" \
+    --hidden-import PyQt6.QtSvg \
+    --copy-metadata keyring \
+    --collect-submodules keyring.backends \
+    --hidden-import zeroconf \
     app.py
 
-# Rename to include version + arch so multiple builds can coexist.
-OUT="dist/${APP_NAME}-${VERSION}-${ARCH}"
+OUT="dist/${APP_NAME}-${VERSION#v}-${ARCH}"
 mv -f "dist/${APP_NAME}" "$OUT"
 
 echo

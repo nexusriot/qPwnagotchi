@@ -1,0 +1,15 @@
+#!/bin/sh
+# Restore the fake device to its pristine state (run as root via sudo).
+cp /opt/pristine/config.toml /etc/pwnagotchi/config.toml
+chmod 0644 /etc/pwnagotchi/config.toml
+rm -f /etc/pwnagotchi/config.toml.bak.* /etc/pwnagotchi/*.toml.bak.*
+rm -f /etc/pwnagotchi/missing.toml /etc/pwnagotchi/does-not-exist.toml
+rm -rf /root/handshakes && mkdir -p /root/handshakes
+for i in 1 2 3; do touch /root/handshakes/net$i.pcap; done; touch /root/handshakes/readme.txt
+rm -f /var/lib/fakesvc/*.restarts /var/lib/fakesvc/*.marker /var/lib/fakesvc/plugins.installed
+echo active > /var/lib/fakesvc/pwnagotchi.state
+rm -f /root/.pwnagotchi-manual; touch /root/.pwnagotchi-auto
+chmod -R u+rwX /home/pi 2>/dev/null
+find /home/pi -mindepth 1 -maxdepth 1 ! -name '.*' -exec rm -rf {} +
+rm -rf /home/pi/.ssh /tmp/qpwn-* /tmp/.qpwn-*
+exit 0

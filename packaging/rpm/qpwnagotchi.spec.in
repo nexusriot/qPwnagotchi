@@ -1,0 +1,42 @@
+%global debug_package %{nil}
+%global __os_install_post %{nil}
+%global _build_id_links none
+AutoReqProv: no
+
+Name:       qpwnagotchi
+Version:    @RPMVERSION@
+Release:    1
+Summary:    PyQt6 manager for your own Pwnagotchi over SSH
+License:    Unspecified (see repository)
+URL:        https://github.com/vladsever/qPwnagotchi
+BuildArch:  @RPMARCH@
+# Bundled via PyInstaller; only system graphics/Qt platform libs are needed.
+Requires:   libxkbcommon, fontconfig, nss, libatomic, libxkbfile, dbus-libs, mesa-libGL, mesa-libEGL
+
+%description
+qPwnagotchi is a small desktop GUI to manage your own Pwnagotchi device over
+SSH: status, service control, logs, config edit with backup, plugins, SFTP,
+fleet view. Intentionally does not provide offensive features.
+
+%install
+install -D -m 0755 @BIN@ %{buildroot}/usr/bin/qpwnagotchi
+install -D -m 0644 @SRC@/packaging/qpwnagotchi.desktop %{buildroot}/usr/share/applications/qpwnagotchi.desktop
+install -D -m 0644 @SRC@/README.md %{buildroot}/usr/share/doc/qpwnagotchi/README.md
+install -D -m 0644 @SRC@/packaging/qpwnagotchi.svg %{buildroot}/usr/share/icons/hicolor/scalable/apps/qpwnagotchi.svg
+for s in 16 24 32 48 64 128 256 512; do
+  install -D -m 0644 @SRC@/packaging/qpwnagotchi-$s.png %{buildroot}/usr/share/icons/hicolor/${s}x${s}/apps/qpwnagotchi.png
+done
+
+%files
+/usr/bin/qpwnagotchi
+/usr/share/applications/qpwnagotchi.desktop
+/usr/share/doc/qpwnagotchi
+/usr/share/icons/hicolor/*/apps/qpwnagotchi.*
+
+%post
+gtk-update-icon-cache -q -f /usr/share/icons/hicolor >/dev/null 2>&1 || :
+update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || :
+
+%postun
+gtk-update-icon-cache -q -f /usr/share/icons/hicolor >/dev/null 2>&1 || :
+update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || :

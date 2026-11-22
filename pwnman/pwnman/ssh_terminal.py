@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-from pwnman.pwnman.async_utils import run_in_thread, quote_bash
+from pwnman.pwnman.async_utils import run_in_thread, quote_bash, cd_command
 
 
 class SSHTerminalWidget(QtWidgets.QWidget):
@@ -25,7 +25,7 @@ class SSHTerminalWidget(QtWidgets.QWidget):
 
         # Top bar
         top = QtWidgets.QHBoxLayout()
-        self.cwd = QtWidgets.QLineEdit("/home/pi")
+        self.cwd = QtWidgets.QLineEdit("~")
         self.cwd.setToolTip("Remote working directory (best-effort)")
         self.btn_clear = QtWidgets.QPushButton("Clear")
         self.btn_clear.clicked.connect(lambda: self.out.setPlainText(""))
@@ -82,12 +82,21 @@ class SSHTerminalWidget(QtWidgets.QWidget):
         sb = self.out.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _wrap_bash(self, cmd: str) -> str:
-        # run in requested CWD; keep it simple and robust
-        wd = (self.cwd.text().strip() or "/").replace('"', '\\"')
-        # user cmd remains as-is, executed by bash -lc
-        script = f'cd "{wd}" 2>/dev/null || true; {cmd}'
-        return script
+    _PWD_MARK = "__QPWN_PWD__"
+
+    def _script(self, cmd: str) -> str:
+        """cd to the CWD, run cmd, then report the final cwd + exit code.
+
+        Each command is its own SSH exec, so a plain ``cd /etc`` would be
+        forgotten; echoing ``pwd`` afterwards lets us carry the directory over.
+        """
+        return (
+            f"{cd_command(self.cwd.text())} 2>/dev/null || true\n"
+            f"{cmd}\n"
+            f"__rc=$?\n"
+            f"printf '\\n%s\\n' {self._PWD_MARK}; pwd\n"
+            f"exit $__rc\n"
+        )
 
     def _on_enter(self):
         if not getattr(self.ssh, "connected", False):
@@ -103,10 +112,9 @@ class SSHTerminalWidget(QtWidgets.QWidget):
         self.inp.clear()
 
         self._append(f"$ {cmd}")
+        script = self._script(cmd)
 
         def do():
-            wd = (self.cwd.text().strip() or "/").replace('"', '\\"')
-            script = f'cd "{wd}" 2>/dev/null || true; {cmd}'
             full = f"bash -lc {quote_bash(script)}"
             r = self.ssh.run(full, timeout_sec=120)
             return r.stdout or "", r.stderr or "", getattr(r, "exit_status", None)
@@ -116,14 +124,18 @@ class SSHTerminalWidget(QtWidgets.QWidget):
                 self._append(f"[ERROR] {err}")
                 return
             out, serr, code = res
+            head, sep, tail = out.rpartition(f"\n{self._PWD_MARK}\n")
+            if sep:
+                out = head
+                newcwd = tail.strip()
+                if newcwd:
+                    self.cwd.setText(newcwd)
             if out:
                 self._append(out.rstrip())
             if serr:
                 self._append(serr.rstrip())
             if code not in (None, 0):
                 self._append(f"[exit {code}]")
-            if cmd.startswith("cd ") or cmd == "cd":
-                self._refresh_pwd()
 
         run_in_thread(self, do, done)
 
@@ -132,8 +144,8 @@ class SSHTerminalWidget(QtWidgets.QWidget):
             return
 
         def do():
-            wd = (self.cwd.text().strip() or "/").replace('"', '\\"')
-            script = f'cd "{wd}" 2>/dev/null || true; pwd'
+            wd = self.cwd.text().strip() or "/"
+            script = f"{cd_command(wd)} 2>/dev/null || true; pwd"
             cmd = f"bash -lc {quote_bash(script)}"
             r = self.ssh.run(cmd, timeout_sec=10)
             return (r.stdout or "").strip() or wd

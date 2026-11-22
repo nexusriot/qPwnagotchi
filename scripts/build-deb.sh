@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 APP_NAME="${APP_NAME:-qpwnagotchi}"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-$(./scripts/version.sh)}"
 # Strip a leading "v" so 0.1.0 not v0.1.0 (Debian dislikes letters at the front).
 VERSION="${VERSION#v}"
 ARCH="${ARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}"

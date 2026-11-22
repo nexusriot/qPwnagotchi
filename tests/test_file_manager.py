@@ -111,3 +111,13 @@ class SftpRmtreeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CdCommandTest(unittest.TestCase):
+    def test_cd_command_variants(self):
+        from pwnman.pwnman.async_utils import cd_command
+        self.assertEqual(cd_command("~"), 'cd "$HOME"')
+        self.assertEqual(cd_command("~/x y"), 'cd "$HOME"/\'x y\'')
+        self.assertEqual(cd_command("/a b"), "cd '/a b'")
+        self.assertEqual(cd_command(""), "cd '/'")
+        self.assertEqual(cd_command("/x$(id)"), "cd '/x$(id)'")

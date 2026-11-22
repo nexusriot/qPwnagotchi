@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "temp=46.2'C"

@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
 
-from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtCore, QtWidgets
 
-from pwnman.pwnman.async_utils import quote_bash
+from pwnman.pwnman.async_utils import quote_bash, run_in_thread
+from pwnman.pwnman.known_hosts import KnownHosts, fetch_host_key
 from pwnman.pwnman.fleet import DeviceStatus, probe_device, run_remote_command
+from pwnman.pwnman import theme
 from pwnman.pwnman.models import ConnectionProfile
 from pwnman.pwnman.profile_store import ProfileStore
 
 COLUMNS = ["Profile", "Host", "Online", "Service", "Uptime",
            "Temp", "Mem", "Handshakes", "AI epoch", "Polled"]
+
+
+def should_probe(failures: int, cycle: int) -> bool:
+    """Back off dead devices: probe every cycle for the first 2 failures, then
+    every 2nd, 4th, 8th, ... (max 16th) cycle."""
+    if failures < 3:
+        return True
+    return cycle % (2 ** min(failures - 2, 4)) == 0
 
 
 class _Signals(QtCore.QObject):
@@ -53,6 +62,8 @@ class _CmdTask(QtCore.QRunnable):
 class FleetTab(QtWidgets.QWidget):
     """Concurrent multi-device dashboard. Independent of the active SSH session."""
 
+    statusUpdated = QtCore.pyqtSignal(object)  # DeviceStatus (for alerts)
+
     def __init__(self, store: ProfileStore, main_window=None, parent=None):
         super().__init__(parent)
         self.store = store
@@ -62,6 +73,10 @@ class FleetTab(QtWidgets.QWidget):
         self.signals.probed.connect(self._on_probed)
         self.signals.cmd_done.connect(self._on_cmd_done)
         self._row_by_name: dict[str, int] = {}
+        self._failures: dict[str, int] = {}
+        self._cycle = 0
+        self._shown_once = False
+        self._hostkey_errors: dict[str, object] = {}
 
         self._build()
 
@@ -84,6 +99,11 @@ class FleetTab(QtWidgets.QWidget):
         self.chk_auto.toggled.connect(self._auto_changed)
         self.spin_interval.valueChanged.connect(self._auto_changed)
 
+        self.btn_trust = QtWidgets.QPushButton("Trust host key…")
+        self.btn_trust.setToolTip("Fetch and verify the SSH host key of the selected device(s)")
+        self.btn_trust.clicked.connect(self._trust_selected)
+        self.btn_csv = QtWidgets.QPushButton("Export CSV…")
+        self.btn_csv.clicked.connect(self._export_csv)
         self.btn_connect = QtWidgets.QPushButton("Connect selected")
         self.btn_connect.clicked.connect(self._connect_selected)
         self.btn_restart = QtWidgets.QPushButton("Restart pwnagotchi")
@@ -100,6 +120,8 @@ class FleetTab(QtWidgets.QWidget):
         bar.addWidget(self.spin_interval)
         bar.addSpacing(16)
         bar.addWidget(self.btn_connect)
+        bar.addWidget(self.btn_trust)
+        bar.addWidget(self.btn_csv)
         bar.addStretch(1)
         bar.addWidget(self.btn_restart)
         bar.addWidget(self.btn_run)
@@ -125,6 +147,23 @@ class FleetTab(QtWidgets.QWidget):
         self.logview.setMaximumBlockCount(1000)
         self.logview.setMaximumHeight(140)
         root.addWidget(self.logview, 1)
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if not self._shown_once:
+            # The table used to stay empty until the first timer tick (30 s).
+            self._shown_once = True
+            QtCore.QTimer.singleShot(0, self.refresh)
+
+    def restyle(self):
+        """Re-colour status cells after a theme switch."""
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 2)
+            if it is not None and it.text() in ("yes", "no"):
+                it.setForeground(theme.status_color("ok" if it.text() == "yes" else "bad", self))
+            sv = self.table.item(r, 3)
+            if sv is not None and sv.text() and sv.text() != "active":
+                sv.setForeground(theme.status_color("warn", self))
 
     def _log(self, msg: str):
         self.logview.appendPlainText(f"{time.strftime('%H:%M:%S')}  {msg}")
@@ -159,18 +198,34 @@ class FleetTab(QtWidgets.QWidget):
         if not self.store.profiles:
             self.table.setRowCount(0)
             self._row_by_name.clear()
+            self._rows_sig = []
             return
-        self._rebuild_rows()
-        for p in self.store.profiles:
-            self.pool.start(_ProbeTask(p, self.signals))
+        profiles = self.store.profiles
+        sig = [(p.name, p.username, p.host, p.port) for p in profiles]
+        if sig != getattr(self, "_rows_sig", None):
+            # Rebuilding clears the selection, so only do it when the set of
+            # devices actually changed (it used to run on every auto-poll and
+            # silently deselect rows between the user's click and the action).
+            self._rebuild_rows()
+            self._rows_sig = sig
+        self._cycle += 1
+        for p in profiles:
+            if should_probe(self._failures.get(p.name, 0), self._cycle):
+                self.pool.start(_ProbeTask(p, self.signals))
 
     @QtCore.pyqtSlot(object)
     def _on_probed(self, st: DeviceStatus):
+        self.statusUpdated.emit(st)
         row = self._row_by_name.get(st.name)
         if row is None:
             return
+        self._failures[st.name] = 0 if st.online else self._failures.get(st.name, 0) + 1
+        if getattr(st, "host_key_error", None) is not None:
+            self._hostkey_errors[st.name] = st.host_key_error
+        else:
+            self._hostkey_errors.pop(st.name, None)
         online = QtWidgets.QTableWidgetItem("yes" if st.online else "no")
-        color = QtGui.QColor(0, 140, 0) if st.online else QtGui.QColor(170, 0, 0)
+        color = theme.status_color("ok" if st.online else "bad", self)
         online.setForeground(color)
         if st.error:
             online.setToolTip(st.error)
@@ -179,7 +234,7 @@ class FleetTab(QtWidgets.QWidget):
         svc = st.service_active or ""
         svc_item = QtWidgets.QTableWidgetItem(svc)
         if svc and svc != "active":
-            svc_item.setForeground(QtGui.QColor(170, 90, 0))
+            svc_item.setForeground(theme.status_color("warn", self))
         self.table.setItem(row, 3, svc_item)
 
         self._set(row, 4, st.uptime)
@@ -206,6 +261,57 @@ class FleetTab(QtWidgets.QWidget):
             if p is not None:
                 out.append(p)
         return out
+
+    def _trust_selected(self):
+        sel = self._selected_profiles()
+        if not sel:
+            QtWidgets.QMessageBox.information(self, "Trust", "Select a device row first.")
+            return
+        for p in sel:
+            self._trust_one(p)
+
+    def _trust_one(self, p: ConnectionProfile):
+        port = int(p.port or 22)
+        kh = KnownHosts()
+
+        def do():
+            return fetch_host_key(p.host, port)
+
+        def done(key, err):
+            if err:
+                self._log(f"{p.name}: cannot fetch host key: {err}")
+                return
+            from pwnman.pwnman.known_hosts import fingerprint
+            old = kh.known_fingerprint(p.host, port)
+            if old and old != fingerprint(key):
+                text = (f"HOST KEY CHANGED for {p.name} ({p.host}).\n\nKnown: {old}\n"
+                        f"Now:   {fingerprint(key)}\n\nReplace the stored key? Only do this "
+                        "if you re-flashed the device.")
+            else:
+                text = (f"{p.name} ({p.host}:{port})\n{key.get_name()} {fingerprint(key)}\n\n"
+                        "Trust this host key?")
+            if QtWidgets.QMessageBox.question(self, "Trust host key", text) == \
+                    QtWidgets.QMessageBox.StandardButton.Yes:
+                kh.trust(p.host, port, key, replace=bool(old))
+                self._log(f"{p.name}: host key trusted.")
+                self._failures[p.name] = 0
+                self.refresh()
+
+        run_in_thread(self, do, done)
+
+    def _export_csv(self, path: str | None = None):
+        import csv
+        if not path:
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export fleet", "fleet.csv")
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(COLUMNS)
+            for r in range(self.table.rowCount()):
+                w.writerow([(self.table.item(r, c).text() if self.table.item(r, c) else "")
+                            for c in range(len(COLUMNS))])
+        self._log(f"Exported {self.table.rowCount()} row(s) to {path}")
 
     def _connect_selected(self):
         sel = self._selected_profiles()

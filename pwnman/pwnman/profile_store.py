@@ -49,8 +49,14 @@ class ProfileStore:
     with owner-only permissions (0600) on POSIX systems.
     """
 
-    def __init__(self, path: Optional[Path] = None) -> None:
+    def __init__(self, path: Optional[Path] = None, secrets=None) -> None:
+        """``secrets``: None = plaintext 0600 JSON (legacy); ``"auto"`` = use the
+        OS keyring when available; or any object with get/set/delete."""
         self.path = Path(path) if path else profiles_path()
+        if secrets == "auto":
+            from pwnman.pwnman.secrets_store import KeyringBackend
+            secrets = KeyringBackend.detect()
+        self.secrets = secrets
         self._profiles: list[ConnectionProfile] = []
         self._active: str = ""
         self.load()
@@ -87,6 +93,9 @@ class ProfileStore:
         self._profiles.append(profile)
 
     def delete(self, name: str) -> None:
+        if self.secrets is not None:
+            self.secrets.delete(f"{name}:ssh")
+            self.secrets.delete(f"{name}:lcd")
         self._profiles = [p for p in self._profiles if p.name != name]
         if self._active == name:
             self._active = self._profiles[0].name if self._profiles else ""
@@ -110,14 +119,33 @@ class ProfileStore:
 
         raw = data.get("profiles", []) if isinstance(data, dict) else []
         self._profiles = [ConnectionProfile.from_dict(d) for d in raw if isinstance(d, dict)]
+        if self.secrets is not None:
+            for p in self._profiles:
+                # Plain values in the file (pre-keyring) win; they are moved to
+                # the keyring on the next save().
+                if not p.password:
+                    p.password = self.secrets.get(f"{p.name}:ssh")
+                if not p.lcd_pass:
+                    p.lcd_pass = self.secrets.get(f"{p.name}:lcd")
         active = data.get("active", "") if isinstance(data, dict) else ""
         self._active = active if active in self.names() else ""
 
     def save(self) -> None:
+        dicts = []
+        for p in self._profiles:
+            d = p.to_dict()
+            if self.secrets is not None:
+                ok1 = self.secrets.set(f"{p.name}:ssh", p.password)
+                ok2 = self.secrets.set(f"{p.name}:lcd", p.lcd_pass)
+                if ok1:
+                    d["password"] = ""
+                if ok2:
+                    d["lcd_pass"] = ""
+            dicts.append(d)
         payload = {
             "version": SCHEMA_VERSION,
             "active": self._active,
-            "profiles": [p.to_dict() for p in self._profiles],
+            "profiles": dicts,
         }
         text = json.dumps(payload, indent=2, ensure_ascii=False)
 

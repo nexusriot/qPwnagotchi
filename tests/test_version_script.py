@@ -66,6 +66,9 @@ class VersionScriptTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="qpwn-vertest-"))
         # Mirror the script into a fake repo root so its `cd ..` lands here.
         (self.tmp / "scripts").mkdir()
+        (self.tmp / "pwnman" / "pwnman").mkdir(parents=True)
+        (self.tmp / "pwnman" / "pwnman" / "version.py").write_text(
+            '__version__ = "0.1.0"\n')
         shutil.copy2(SCRIPT, self.tmp / "scripts" / "version.sh")
         (self.tmp / "scripts" / "version.sh").chmod(0o755)
 
@@ -89,6 +92,17 @@ class VersionScriptTest(unittest.TestCase):
     def test_no_git_returns_fallback(self):
         # No .git directory at all.
         self.assertEqual(_run_script(self.tmp), "0.1.0")
+
+    def test_base_version_comes_from_version_py(self):
+        (self.tmp / "pwnman" / "pwnman" / "version.py").write_text(
+            '__version__ = "3.4.5"\n')
+        self.assertEqual(_run_script(self.tmp), "3.4.5")
+
+    def test_repo_version_py_is_parseable_by_script(self):
+        from pwnman.pwnman.version import __version__
+        self.assertRegex(__version__, DEB_VERSION_RE)
+        out = _run_script(REPO)
+        self.assertTrue(out.startswith(__version__) or re.match(r"^\d", out))
 
     def test_untagged_clean_uses_short_sha(self):
         self._init_repo_with_commit()

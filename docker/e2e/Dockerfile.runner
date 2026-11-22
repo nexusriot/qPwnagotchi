@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1.7
+# Test runner: runs the real GUI (offscreen Qt) against the fake Pwnagotchi.
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-client git libatomic1 libxkbfile1 libgl1 libegl1 libglib2.0-0 libxkbcommon0 libxkbcommon-x11-0 \
+        libfontconfig1 libdbus-1-3 libnss3 libnspr4 libasound2 \
+        libxcomposite1 libxdamage1 libxrandr2 libxtst6 libxi6 libxfixes3 libxext6 \
+        libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+        libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xkb1 libxcb-xinerama0 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY requirements-dev.txt requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements-dev.txt
+COPY . .
+ENV QT_QPA_PLATFORM=offscreen \
+    QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox --disable-gpu --disable-dev-shm-usage" \
+    QTWEBENGINE_DISABLE_SANDBOX=1 \
+    HOME=/tmp/home XDG_CONFIG_HOME=/tmp/home/.config PYTHONDONTWRITEBYTECODE=1
+RUN mkdir -p /tmp/home
+CMD ["python", "-m", "pytest", "-v", "tests"]

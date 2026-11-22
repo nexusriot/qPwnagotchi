@@ -1,0 +1,10 @@
+# Fake pwnagotchi config
+main.name = "e2e-gotchi"
+main.lang = "en"
+main.plugins.grid.enabled = true   # keep this comment
+main.plugins.gps.enabled = false
+main.custom_secret = "pa$$word with \\backslash and `ticks` $HOME"
+
+[ui.web]
+enabled = true
+username = "changeme"

@@ -1,0 +1,21 @@
+#!/bin/sh
+# Fake `pwnagotchi plugins ...` CLI. State in /var/lib/fakesvc/plugins.installed
+[ "$1" = plugins ] || { echo "fake pwnagotchi: only 'plugins' supported" >&2; exit 2; }
+shift
+act="$1"; shift
+st=/var/lib/fakesvc/plugins.installed
+case "$act" in
+  list)
+    echo "+--------+---------+-----------+"
+    echo "| Name   | Version | Status    |"
+    echo "+--------+---------+-----------+"
+    echo "| grid   | 1.0.1   | enabled   |"
+    echo "| gps    | 1.0.0   | installed, update 1.1.0 available |"
+    echo "| memtemp | 2.0    | available |"
+    for p in $(cat $st 2>/dev/null); do echo "| $p | 0.1 | installed |"; done
+    echo "+--------+---------+-----------+" ;;
+  install) echo "$1" >> $st; echo "Installed $1" ;;
+  update) echo "Updated plugin lists" ;;
+  upgrade) echo "Upgraded 2 plugins" ;;
+  *) echo "unsupported: $act" >&2; exit 1 ;;
+esac

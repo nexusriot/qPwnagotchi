@@ -1,0 +1,42 @@
+name: ci
+on:
+  push: {branches: [main]}
+  tags: ["v*"]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: {python: ["3.10", "3.12", "3.13"]}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: actions/setup-python@v5
+        with: {python-version: "${{ matrix.python }}"}
+      - run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1 libnss3 libatomic1 libxcb-cursor0 libxdamage1 libxcomposite1 libxrandr2 libxtst6 libasound2t64 || true
+      - run: pip install -r requirements-dev.txt ruff
+      - run: ruff check pwnman tests app.py
+      - run: QT_QPA_PLATFORM=offscreen python -m pytest -q tests --ignore=tests/e2e
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - run: ./scripts/e2e.sh
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [unit, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: docker/setup-qemu-action@v3
+        with: {platforms: arm64}
+      - uses: docker/setup-buildx-action@v3
+      - run: make dist-all
+      - run: ./scripts/e2e-package.sh
+      - uses: actions/upload-artifact@v4
+        with: {name: dist, path: dist/*}

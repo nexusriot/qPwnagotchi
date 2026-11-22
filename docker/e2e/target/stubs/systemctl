@@ -1,0 +1,10 @@
+#!/bin/sh
+# systemctl <action> <unit>; state lives in /var/lib/fakesvc
+act="$1"; unit="${2%.service}"; f="/var/lib/fakesvc/$unit.state"
+case "$act" in
+  is-active) s=$(cat "$f" 2>/dev/null || echo inactive); echo "$s"; [ "$s" = active ] ;;
+  start|restart) echo active > "$f"; [ "$act" = restart ] && date +%s%N >> /var/lib/fakesvc/$unit.restarts; exit 0 ;;
+  stop) echo inactive > "$f"; exit 0 ;;
+  status) s=$(cat "$f" 2>/dev/null || echo inactive); echo "● $unit.service - fake ($s)"; echo "   Active: $s"; [ "$s" = active ] ;;
+  *) echo "unsupported: $act" >&2; exit 1 ;;
+esac

@@ -5,8 +5,8 @@ import os
 import posixpath
 import shutil
 import stat
+import threading
 from dataclasses import dataclass
-from typing import Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
@@ -153,7 +153,10 @@ class FileManagerWidget(QtWidgets.QWidget):
         self.ssh = ssh_client
 
         self.local_dir = os.path.expanduser("~")
-        self.remote_dir = "/home/pi"
+        self.remote_dir = "/"
+        self._remote_home_resolved = False
+        self._last_good_remote = "/"
+        self._cancel_evt = threading.Event()
 
         self._build()
 
@@ -205,8 +208,12 @@ class FileManagerWidget(QtWidgets.QWidget):
         self.transfer_bar = QtWidgets.QProgressBar()
         self.transfer_bar.setRange(0, 100)
         self.transfer_bar.setValue(0)
+        self.btn_cancel = QtWidgets.QPushButton("Cancel")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(lambda: self._cancel_evt.set())
         p.addWidget(self.transfer_label)
         p.addWidget(self.transfer_bar, 1)
+        p.addWidget(self.btn_cancel)
         root.addLayout(p)
 
         self.btn_refresh.clicked.connect(self.refresh)
@@ -281,6 +288,10 @@ class FileManagerWidget(QtWidgets.QWidget):
             self.local_dir = os.path.join(self.local_dir, name)
         self._local_refresh()
 
+    def reset_remote(self):
+        """Forget the remote cwd; the next refresh starts in the login home."""
+        self._remote_home_resolved = False
+
     def refresh(self):
         self._local_refresh()
         if not getattr(self.ssh, "connected", False):
@@ -288,6 +299,14 @@ class FileManagerWidget(QtWidgets.QWidget):
 
         def do():
             sftp = self.ssh.sftp()
+            if not self._remote_home_resolved:
+                # The login user is not necessarily "pi".
+                try:
+                    self.remote_dir = sftp.normalize(".")
+                except OSError:
+                    self.remote_dir = "/"
+                self._remote_home_resolved = True
+                self._last_good_remote = self.remote_dir
             rows: list[ItemRow] = []
             if self.remote_dir != "/":
                 rows.append(ItemRow("..", "dir", ""))
@@ -302,7 +321,13 @@ class FileManagerWidget(QtWidgets.QWidget):
         def done(res, err):
             if err:
                 self.log.emit(f"[ERROR] Files refresh: {err}")
+                # Listing failed (e.g. permission denied): go back to the last
+                # directory that worked, otherwise the table would show one
+                # folder while uploads/deletes target another.
+                self.remote_dir = self._last_good_remote
+                self.remote_path_label.setText(self.remote_dir)
                 return
+            self._last_good_remote = self.remote_dir
             self.remote_path_label.setText(self.remote_dir)
             self._fill(self.remote_view, res)
             self.log.emit("Files refreshed.")
@@ -408,11 +433,51 @@ class FileManagerWidget(QtWidgets.QWidget):
         walk(src)
         return total
 
+    def _resolve_conflicts(self, direction: str, entries):
+        """Ask what to do about top-level targets that already exist.
+
+        Returns the entries to transfer (possibly fewer) or None to cancel.
+        """
+        existing = []
+        for entry in entries:
+            lp, rp, _is_dir = entry
+            try:
+                if direction == "download":
+                    exists = os.path.exists(lp)
+                else:
+                    self.ssh.sftp().stat(rp)
+                    exists = True
+            except OSError:
+                exists = False
+            if exists:
+                existing.append(entry)
+        if not existing:
+            return entries
+        names = "\n  ".join(os.path.basename(rp) for _lp, rp, _d in existing[:12])
+        ans = QtWidgets.QMessageBox.question(
+            self, "Already exists",
+            f"{len(existing)} item(s) already exist at the destination:\n\n  {names}\n\n"
+            "Yes = overwrite, No = skip existing, Cancel = abort.",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No
+            | QtWidgets.QMessageBox.StandardButton.Cancel)
+        if ans == QtWidgets.QMessageBox.StandardButton.Yes:
+            return entries
+        if ans == QtWidgets.QMessageBox.StandardButton.No:
+            skip = {id(e) for e in existing}
+            return [e for e in entries if id(e) not in skip]
+        return None
+
     def _start_batch_transfer(self, direction: str,
                               entries: list[tuple[str, str, bool]]):
         """entries: list of (local_path, remote_path, is_dir)."""
         if not getattr(self.ssh, "connected", False) or not entries:
             return
+        entries = self._resolve_conflicts(direction, entries)
+        if not entries:
+            return
+        self._cancel_evt.clear()
+        self.btn_cancel.setEnabled(True)
 
         self.transfer_bar.setRange(0, 100)
         self.transfer_bar.setValue(0)
@@ -446,14 +511,17 @@ class FileManagerWidget(QtWidgets.QWidget):
                     pct = min(100, int(overall_done * 100 / overall_total))
                     self._ui_set_progress(pct)
                 else:
-                    cur = self.transfer_bar.value()
-                    self._ui_set_progress(100 if cur >= 95 else cur + 5)
+                    self._ui_set_progress(50)  # size unknown: indeterminate-ish
 
             for lp, rp, is_dir in entries:
+                if self._cancel_evt.is_set():
+                    raise InterruptedError("cancelled")
                 if not is_dir:
                     base = overall_done
 
                     def cb(d, t, _b=base, _n=os.path.basename(rp)):
+                        if self._cancel_evt.is_set():
+                            raise InterruptedError("cancelled")
                         if overall_total > 0:
                             pct = min(100, int((_b + d) * 100 / overall_total))
                             self._ui_set_label(f"{direction}: {_n}")
@@ -481,6 +549,8 @@ class FileManagerWidget(QtWidgets.QWidget):
                         for a in sftp.listdir_attr(rsrc):
                             rp2 = posixpath.join(rsrc, a.filename)
                             lp2 = os.path.join(ldst, a.filename)
+                            if self._cancel_evt.is_set():
+                                raise InterruptedError("cancelled")
                             if stat.S_ISDIR(a.st_mode):
                                 walk_dl(rp2, lp2)
                             else:
@@ -502,6 +572,8 @@ class FileManagerWidget(QtWidgets.QWidget):
                                 self._sftp_mkdir_p(
                                     sftp, posixpath.join(rdir, d))
                             for f in files:
+                                if self._cancel_evt.is_set():
+                                    raise InterruptedError("cancelled")
                                 report(0, f)
                                 sftp.put(os.path.join(root, f),
                                          posixpath.join(rdir, f))
@@ -516,6 +588,12 @@ class FileManagerWidget(QtWidgets.QWidget):
             return True
 
         def done(res, err):
+            self.btn_cancel.setEnabled(False)
+            if isinstance(err, InterruptedError):
+                self.transfer_label.setText("Cancelled.")
+                self.log.emit("Transfer cancelled.")
+                self.refresh()
+                return
             if err:
                 self.transfer_label.setText(f"Error: {err}")
                 self.log.emit(f"[ERROR] Transfer: {err}")
@@ -655,17 +733,26 @@ class FileManagerWidget(QtWidgets.QWidget):
                 data = fh.read()
             if looks_binary(data[:8192]):
                 raise RuntimeError("File appears to be binary.")
-            return data.decode("utf-8", errors="replace")
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                # errors="replace" here used to silently corrupt the file on save.
+                raise RuntimeError("File is not valid UTF-8; editing is disabled "
+                                   "to avoid corrupting it.") from None
+            return text, ("\r\n" in text)
 
         def done(res, err):
             if err:
                 self.log.emit(f"[ERROR] Edit load: {err}")
                 QtWidgets.QMessageBox.critical(self, "Edit failed", str(err))
                 return
-            dlg = RemoteEditDialog(f"Edit: {path}", res, self)
+            text, crlf = res
+            dlg = RemoteEditDialog(f"Edit: {path}", text, self)
             if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
                 return
             new_text = dlg.text()
+            if crlf:  # keep the file's Windows line endings
+                new_text = new_text.replace("\r\n", "\n").replace("\n", "\r\n")
 
             def save():
                 sftp = self.ssh.sftp()

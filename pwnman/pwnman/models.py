@@ -15,6 +15,7 @@ class ConnectionProfile:
     lcd_url: str = ""
     lcd_user: str = "changeme"
     lcd_pass: str = "changeme"
+    auto_connect: bool = False  # connect to this profile on app launch
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1.7
+# Hermetic Windows build under Wine: PyInstaller (onedir) + portable zip +
+# NSIS installer. Runs on any linux/amd64 Docker host.
+#
+#   docker buildx build --build-arg VERSION=0.2.0 --target artifacts \
+#       --output type=local,dest=dist -f docker/Dockerfile.windows .
+FROM tobix/pywine:3.12 AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends nsis zip \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.wine-pip-cache wine python -m pip install --cache-dir /root/.wine-pip-cache -r requirements.txt
+
+COPY . .
+ARG VERSION=0.0.0
+ENV VERSION=${VERSION}
+RUN ./scripts/build-windows.sh && ls -la dist
+
+FROM scratch AS artifacts
+COPY --from=build /src/dist/ /

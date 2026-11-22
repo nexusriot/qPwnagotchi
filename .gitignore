@@ -1,8 +1,51 @@
-.idea/
+# --- Python environments -----------------------------------------------------
 .venv/
+venv/
+env/
+.env
 
+# --- Python bytecode / packaging metadata ------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# --- Test, lint and type-check caches ----------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Build output (make build / deb / rpm / linux-* / windows / dist-all) ----
 build/
 dist/
-*.spec
-__pycache__/
-*.pyc
+# PyInstaller writes a <name>.spec next to the sources; the build scripts pass
+# flags on the command line, so these are generated leftovers. Anchored to the
+# repo root so packaging/rpm/qpwnagotchi.spec.in (a real template) is unaffected.
+/*.spec
+# Stray packages dropped outside dist/
+/*.deb
+/*.rpm
+/*.exe
+/*.zip
+
+# --- Editors / IDEs / OS ------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# --- Local tooling state ------------------------------------------------------
+.claude/settings.local.json
+
+# --- Runtime data that must never be committed -------------------------------
+# The app keeps profiles (passwords!), known_hosts and metrics.db in the per-user
+# config dir, not in the repo; these guard against pointing XDG_CONFIG_HOME here.
+profiles.json
+known_hosts
+metrics.db
+*.db-journal

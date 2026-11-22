@@ -5,8 +5,8 @@ try:
         parse_plugins_from_ls,
         extract_enabled_from_toml,
         set_plugin_enabled_in_toml,
-        quote_bash,
     )
+    from pwnman.pwnman.async_utils import quote_bash
     IMPORT_ERR = None
 except Exception as e:  # PyQt6/WebEngine unavailable in this environment
     IMPORT_ERR = e
@@ -59,10 +59,28 @@ class SetEnabledTest(unittest.TestCase):
         out = set_plugin_enabled_in_toml(toml, "grid", True)
         self.assertEqual(extract_enabled_from_toml(out).get("grid"), True)
 
-    def test_appends_block_when_absent(self):
+    def test_appends_dotted_key_when_absent(self):
         out = set_plugin_enabled_in_toml("main.name = 'x'\n", "newp", True)
-        self.assertIn("[main.plugins.newp]", out)
+        self.assertIn("main.plugins.newp.enabled = true", out)
         self.assertEqual(extract_enabled_from_toml(out).get("newp"), True)
+
+    def test_new_key_goes_before_first_table_header(self):
+        # Appending after a [table] header would put the key in that table.
+        toml = "main.name = 'x'\n\n[ui.web]\nenabled = true\n"
+        out = set_plugin_enabled_in_toml(toml, "newp", True)
+        self.assertLess(out.index("main.plugins.newp.enabled"), out.index("[ui.web]"))
+        self.assertEqual(extract_enabled_from_toml(out), {"newp": True})
+
+    def test_trailing_comment_is_understood_and_kept(self):
+        toml = "main.plugins.grid.enabled = true  # keep me\n"
+        self.assertEqual(extract_enabled_from_toml(toml), {"grid": True})
+        out = set_plugin_enabled_in_toml(toml, "grid", False)
+        self.assertEqual(out.count("main.plugins.grid.enabled"), 1)
+        self.assertIn("= false  # keep me", out)
+
+    def test_table_scoped_to_its_own_block(self):
+        toml = "[main.plugins.a]\nx = 1\n\n[main.plugins.b]\nenabled = true\n"
+        self.assertEqual(extract_enabled_from_toml(toml), {"b": True})
 
     def test_roundtrip_toggle(self):
         toml = "main.plugins.p.enabled = true\n"
